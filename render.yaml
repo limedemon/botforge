@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: botforge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Токен бота-конструктора от @BotFather. Вставляется в панели Render.
+      - key: BOT_TOKEN
+        sync: false
+      # Строка подключения к Neon. Вставляется в панели Render.
+      - key: DATABASE_URL
+        sync: false
