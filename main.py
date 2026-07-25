@@ -241,19 +241,30 @@ class Db:
 
         dsn = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
         ssl_ctx = None if sslmode == "disable" else ssl_mod.create_default_context()
-        self.pg = await asyncpg.create_pool(
-            dsn=dsn,
-            ssl=ssl_ctx,
-            min_size=1,
-            max_size=5,
-            command_timeout=30,
-            # Бесплатная база Neon засыпает; заснувшее соединение надо
-            # выбрасывать, а не пытаться использовать.
-            max_inactive_connection_lifetime=180,
-            statement_cache_size=0,
-        )
-        async with self.pg.acquire() as conn:
-            await conn.execute(DDL_PG)
+
+        # Спящая база просыпается не мгновенно — на старте даём ей несколько
+        # попыток, иначе сервис упадёт и уйдёт в бесконечный перезапуск.
+        for attempt in range(4):
+            try:
+                self.pg = await asyncpg.create_pool(
+                    dsn=dsn,
+                    ssl=ssl_ctx,
+                    min_size=1,
+                    max_size=5,
+                    command_timeout=30,
+                    # Бесплатная база засыпает; заснувшее соединение надо
+                    # выбрасывать, а не пытаться использовать.
+                    max_inactive_connection_lifetime=180,
+                    statement_cache_size=0,
+                )
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    raise
+                log.warning("База не отвечает (%s), жду и пробую снова", exc)
+                await asyncio.sleep(2 * (attempt + 1))
+
+        await self._pg_run("execute", DDL_PG, ())
 
     def _start_sqlite(self) -> None:
         self._sqlite = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
@@ -1123,7 +1134,15 @@ function move(index, delta) {
 }
 function removeStep(index) {
   if (S.steps.length < 2) { setHint("Должен остаться хотя бы один шаг", "err"); return; }
+  var gone = S.steps[index].id;
   S.steps.splice(index, 1);
+  /* Убираем ссылки на удалённый шаг, иначе кнопка вела бы в пустоту. */
+  S.steps.forEach(function (step) {
+    if (step.next === gone) step.next = "";
+    (step.buttons || []).forEach(function (button) {
+      if (button.action !== "url" && button.value === gone) button.value = "";
+    });
+  });
   touch(); render();
 }
 function stepSelect(value, onchange) {
@@ -1165,7 +1184,11 @@ function card(step, index) {
   box.append(select([["message", "отправляет сообщение"],
                      ["ask", "задаёт вопрос и ждёт ответ"]],
     step.kind === "ask" ? "ask" : "message",
-    function (e) { step.kind = e.target.value; touch(); render(); }));
+    function (e) {
+      step.kind = e.target.value;
+      if (step.kind === "ask") step.buttons = [];   /* у вопроса кнопок нет */
+      touch(); render();
+    }));
 
   box.append(el("label", {}, "Текст"));
   box.append(el("textarea", {placeholder: "что напишет бот",
@@ -1236,8 +1259,13 @@ function render() {
 /* ---- панель бота ---- */
 function openBot() {
   if (!BOT.bot_username) return;
-  postEvent("web_app_open_tg_link", {path_full: "/" + BOT.bot_username});
-  setTimeout(function () { location.href = "https://t.me/" + BOT.bot_username; }, 400);
+  var bridge = window.TelegramWebviewProxy ||
+               (window.external && window.external.notify) ||
+               window.parent !== window;
+  /* Внутри Telegram просим открыть чат сам клиент. Уходить по ссылке нельзя:
+     это увело бы страницу редактора. */
+  if (bridge) postEvent("web_app_open_tg_link", {path_full: "/" + BOT.bot_username});
+  else location.href = "https://t.me/" + BOT.bot_username;
 }
 
 async function connect(token, button) {
