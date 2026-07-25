@@ -965,6 +965,10 @@ PAGE_HTML = r"""<!doctype html>
   --button:#3390ec; --button-text:#ffffff; --secondary-bg:#f0f2f5; --danger:#e53935;
 }
 *{box-sizing:border-box}
+/* Скрытое должно быть скрыто. Без этой строки любое наше display:flex
+   перебивает атрибут hidden, и спрятанное окно висит поверх страницы,
+   перехватывая касания. */
+[hidden]{display:none !important}
 html,body{margin:0}
 body{padding:10px 10px 92px;background:var(--secondary-bg);color:var(--text);
      font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;

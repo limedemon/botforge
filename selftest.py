@@ -100,6 +100,10 @@ async def run():
     page = await resp.text()
     check("страница редактора отдаётся", resp.status == 200 and "Конструктор ботов" in page)
     check("официальный скрипт telegram.org не подключён", "telegram-web-app.js" not in page)
+    # Окна прячутся атрибутом hidden, а он слабее любого нашего display —
+    # без этого правила невидимое окно висит поверх и глотает касания.
+    check("спрятанное остаётся спрятанным",
+          re.search(r"\[hidden\]\s*\{[^}]*display\s*:\s*none", page) is not None)
 
     print("\n2. Вход в мини-апп")
     resp = await client.get("/api/state", headers={"X-Init-Data": "hash=подделка"})
