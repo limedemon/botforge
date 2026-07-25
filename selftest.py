@@ -98,6 +98,14 @@ async def run():
     await client.start_server()
     headers = {"X-Init-Data": init_data()}
 
+    # Фоновый обход таймеров останавливаем: на медленной базе прогон идёт
+    # минутами, и обход успевает забрать задание раньше, чем до него дойдёт
+    # проверка. По таймерам ходим сами, вызовом tick_timers().
+    for name in ("timers", "awake"):
+        task = client.server.app.get(name)
+        if task:
+            task.cancel()
+
     # Прошлый прогон мог оборваться и оставить свои записи — убираем их,
     # иначе проверки увидят чужую схему и всё «сломается» на ровном месте.
     stale = await main.db.fetchrow("SELECT * FROM projects WHERE owner_id = $1", OWNER)
@@ -119,6 +127,12 @@ async def run():
     check("спрятанное остаётся спрятанным",
           re.search(r"\[hidden\]\s*\{[^}]*display\s*:\s*none", page) is not None)
     check("списка шагов больше нет", "Список" not in page and "listView" not in page)
+    # Кружок выхода нарочно торчит за край полоски. Любая обрезка на самой
+    # полоске срежет ему половину — это уже случалось.
+    port_rule = re.search(r"\.port\{[^}]*\}", page)
+    check("кружок выхода ничем не обрезан",
+          bool(port_rule) and "overflow" not in port_rule.group(0),
+          port_rule.group(0) if port_rule else "правило .port не найдено")
 
     print("\n2. Вход в мини-апп")
     resp = await client.get("/api/state", headers={"X-Init-Data": "hash=подделка"})

@@ -1448,9 +1448,11 @@ button{cursor:pointer}
 .node-fill{margin-top:6px;padding:7px 9px;border-radius:8px;background:#f2f5f8;
            font-size:12px;color:var(--soft);text-align:center}
 .node-fill.filled{color:var(--ink);text-align:left}
+/* Обрезка длинной надписи висит на самом тексте, а не на полоске: полоска
+   не должна ничего прятать, из неё наружу торчит кружок. */
 .port{position:relative;margin:6px 10px 0;padding:6px 18px 6px 9px;border-radius:8px;
-      background:#eef2f6;font-size:12px;white-space:nowrap;overflow:hidden;
-      text-overflow:ellipsis}
+      background:#eef2f6;font-size:12px}
+.port>span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .port.tail{background:transparent;text-align:right;color:var(--soft);padding-right:18px;
            margin-bottom:8px}
 .dot{position:absolute;right:-7px;top:50%;width:13px;height:13px;border-radius:50%;
