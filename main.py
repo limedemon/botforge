@@ -107,6 +107,7 @@ DEFAULT_SCENARIO: Dict[str, Any] = {
             "trigger": {"type": "command", "value": "/start"},
             "text": "Привет, {name}! Я бот. Что вас интересует?",
             "photo": "", "save_to": "", "notify": False, "next": "",
+            "x": 20, "y": 20,
             "buttons": [
                 {"text": "О нас", "action": "goto", "value": "s2"},
                 {"text": "Оставить заявку", "action": "goto", "value": "s3"},
@@ -117,6 +118,7 @@ DEFAULT_SCENARIO: Dict[str, Any] = {
             "trigger": {"type": "none", "value": ""},
             "text": "Мы работаем с 2010 года и делаем хорошие вещи.",
             "photo": "", "save_to": "", "notify": False, "next": "",
+            "x": 280, "y": 20,
             "buttons": [{"text": "Назад", "action": "goto", "value": "s1"}],
         },
         {
@@ -124,21 +126,21 @@ DEFAULT_SCENARIO: Dict[str, Any] = {
             "trigger": {"type": "none", "value": ""},
             "text": "Как вас зовут?",
             "photo": "", "save_to": "имя", "notify": False, "next": "s4",
-            "buttons": [],
+            "x": 280, "y": 170, "buttons": [],
         },
         {
             "id": "s4", "name": "Заявка: телефон", "kind": "ask",
             "trigger": {"type": "none", "value": ""},
             "text": "Оставьте номер телефона, и мы перезвоним.",
             "photo": "", "save_to": "телефон", "notify": False, "next": "s5",
-            "buttons": [],
+            "x": 540, "y": 170, "buttons": [],
         },
         {
             "id": "s5", "name": "Спасибо", "kind": "message",
             "trigger": {"type": "none", "value": ""},
             "text": "Спасибо, {имя}! Позвоним на {телефон}.",
             "photo": "", "save_to": "", "notify": True, "next": "",
-            "buttons": [],
+            "x": 800, "y": 170, "buttons": [],
         },
     ]
 }
@@ -668,7 +670,7 @@ def clean_scenario(raw: Any) -> dict:
             continue
         trigger = item.get("trigger") or {}
         trigger_type = trigger.get("type")
-        steps.append({
+        step = {
             "id": str(item["id"])[:40],
             "name": str(item.get("name", ""))[:60],
             "kind": "ask" if item.get("kind") == "ask" else "message",
@@ -690,7 +692,15 @@ def clean_scenario(raw: Any) -> dict:
                 for b in (item.get("buttons") or [])[:MAX_BUTTONS]
                 if isinstance(b, dict)
             ],
-        })
+        }
+        # Куда блок положили на схеме. Если координат нет — редактор
+        # расставит блоки сам.
+        for axis in ("x", "y"):
+            value = item.get(axis)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if -100000 < value < 100000:
+                    step[axis] = round(float(value), 1)
+        steps.append(step)
     if not steps:
         raise web.HTTPBadRequest(text="В сценарии нет ни одного шага")
     return {"steps": steps}
@@ -993,17 +1003,90 @@ textarea{resize:vertical;min-height:72px}
 .check input{width:auto}
 h2{font-size:15px;margin:0 0 6px}
 button{font:inherit}
+
+/* ---- переключатель «схема / список» ---- */
+.tabs{display:flex;gap:6px;margin-bottom:10px}
+.tabs button{flex:1;padding:9px;border:none;border-radius:9px;cursor:pointer;
+             background:var(--bg);color:var(--hint)}
+.tabs button.on{background:var(--link);color:var(--button-text);font-weight:600}
+
+/* ---- схема ---- */
+.canvas{position:relative;overflow:hidden;height:62vh;min-height:300px;margin-bottom:10px;
+        background:var(--bg);border-radius:12px;touch-action:none;
+        -webkit-user-select:none;user-select:none}
+.world{position:absolute;left:0;top:0;transform-origin:0 0}
+.wires{position:absolute;left:0;top:0;width:1px;height:1px;overflow:visible;pointer-events:none}
+.wire{fill:none;stroke:var(--link);stroke-width:2;opacity:.9}
+.wire-end{fill:var(--link)}
+.node{position:absolute;width:180px;padding:8px;border-radius:10px;cursor:grab;
+      background:var(--secondary-bg);border:2px solid transparent;
+      box-shadow:0 1px 5px rgba(0,0,0,.13)}
+.node.open{border-color:var(--link)}
+.node.dragging{cursor:grabbing;opacity:.85}
+.node-head{display:flex;gap:5px;align-items:center;font-size:13px;font-weight:600}
+.node-num{color:var(--hint);font-size:11px;font-weight:400}
+.node-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-kind{flex:none;font-size:10px;font-weight:400;padding:1px 5px;border-radius:5px;
+           background:var(--link);color:var(--button-text)}
+.node-badge{display:inline-block;margin-top:5px;padding:1px 6px;border-radius:5px;
+            font-size:11px;background:var(--bg);color:var(--link)}
+.node-text{margin:5px 0 2px;font-size:11px;line-height:1.3;color:var(--hint);
+           max-height:29px;overflow:hidden}
+.port{position:relative;margin-top:4px;padding:3px 16px 3px 7px;border-radius:6px;
+      font-size:11px;background:var(--bg);white-space:nowrap;overflow:hidden;
+      text-overflow:ellipsis}
+.dot{position:absolute;right:-8px;top:50%;width:14px;height:14px;border-radius:50%;
+     transform:translateY(-50%);cursor:pointer;background:var(--link);
+     border:2px solid var(--bg)}
+.dot.armed{background:var(--danger);transform:translateY(-50%) scale(1.4)}
+.dot.dot-url{background:var(--hint);cursor:default}
+.tools{position:absolute;right:8px;bottom:8px;display:flex;gap:6px}
+.tools button{width:34px;height:34px;border:none;border-radius:8px;cursor:pointer;
+              background:var(--secondary-bg);color:var(--text);font-size:15px;opacity:.92}
+.linking{position:absolute;left:8px;top:8px;right:56px;padding:6px 9px;border-radius:8px;
+         font-size:12px;background:var(--link);color:var(--button-text);pointer-events:none}
+
+/* ---- окно правки шага ---- */
+.sheet{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-end}
+.sheet-bg{position:absolute;inset:0;background:rgba(0,0,0,.45)}
+.sheet-body{position:relative;width:100%;max-height:88vh;overflow-y:auto;
+            background:var(--secondary-bg);border-radius:14px 14px 0 0;
+            padding:10px 10px calc(12px + env(safe-area-inset-bottom))}
 </style>
 </head>
 <body>
 <div class="boot" id="boot">Загружаю…</div>
 <div id="app" hidden>
   <div class="card" id="bot"></div>
-  <div id="steps"></div>
+  <div class="tabs">
+    <button data-view="canvas" id="tabCanvas">Схема</button>
+    <button data-view="list" id="tabList">Список</button>
+  </div>
+  <div id="canvasView" hidden>
+    <div class="canvas" id="canvas">
+      <div class="world" id="world"></div>
+      <div class="linking" id="linking" hidden></div>
+      <div class="tools">
+        <button id="zoomIn" title="крупнее">+</button>
+        <button id="zoomOut" title="мельче">−</button>
+        <button id="zoomFit" title="уместить всё">⤢</button>
+      </div>
+    </div>
+  </div>
+  <div id="listView" hidden>
+    <div id="steps"></div>
+  </div>
   <button class="ghost" id="add">+ Добавить шаг</button>
   <div class="bar">
     <span class="hint" id="hint"></span>
     <button class="primary" id="save">Сохранить</button>
+  </div>
+</div>
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-bg" id="sheetBg"></div>
+  <div class="sheet-body">
+    <div id="sheetCard"></div>
+    <button class="primary" id="sheetDone" style="width:100%;margin-top:4px">Готово</button>
   </div>
 </div>
 <script>
@@ -1106,6 +1189,13 @@ async function api(path, options) {
 /* ---- состояние ---- */
 var S = {steps: []};
 var BOT = {connected: false, bot_username: "", people: 0};
+var VIEW = "canvas";      /* какой режим показан: схема или список */
+var OPEN = "";            /* id шага, открытого в окне правки */
+var LINKING = null;       /* {id, out} — от какого кружка тянем стрелку */
+var PAN = {x: 20, y: 20, z: 1, ready: false};
+var NODES = {};           /* id шага -> блок на схеме */
+var NODE_W = 180;
+var SVGNS = "http://www.w3.org/2000/svg";
 
 function setHint(text, kind) {
   var node = document.getElementById("hint");
@@ -1149,6 +1239,38 @@ function stepSelect(value, onchange) {
   var options = [["", "— никуда —"]];
   S.steps.forEach(function (s, i) { options.push([s.id, (i + 1) + ". " + titleOf(s, i)]); });
   return select(options, value, onchange);
+}
+function byId(id) {
+  for (var i = 0; i < S.steps.length; i++) if (S.steps[i].id === id) return S.steps[i];
+  return null;
+}
+
+/* Куда может увести шаг. У сообщения с кнопками — по выходу на кнопку,
+   у остальных — один выход «далее». Это и есть кружки на схеме. */
+function outputsOf(step) {
+  if (step.kind === "ask") {
+    return [{label: "после ответа", kind: "next", to: step.next || ""}];
+  }
+  var buttons = step.buttons || [];
+  if (!buttons.length) {
+    return [{label: "далее", kind: "next", to: step.next || ""}];
+  }
+  return buttons.map(function (button, index) {
+    var link = button.action === "url";
+    return {
+      label: button.text || "кнопка",
+      kind: link ? "url" : "button",
+      index: index,
+      to: link ? "" : (button.value || ""),
+    };
+  });
+}
+
+function setLink(step, outIndex, targetId) {
+  var output = outputsOf(step)[outIndex];
+  if (!output || output.kind === "url") return;
+  if (output.kind === "next") step.next = targetId;
+  else step.buttons[output.index].value = targetId;
 }
 
 /* ---- карточка одного шага ---- */
@@ -1250,10 +1372,355 @@ function card(step, index) {
   return box;
 }
 
-function render() {
+function renderList() {
   var box = document.getElementById("steps");
   box.textContent = "";
   S.steps.forEach(function (step, index) { box.append(card(step, index)); });
+}
+
+/* ======================= схема ======================= */
+
+/* Блокам без координат раскладываем места сами: по столбцу на шаг цепочки. */
+function ensurePositions() {
+  var missing = S.steps.filter(function (s) { return typeof s.x !== "number"; });
+  if (!missing.length) return;
+  if (missing.length === S.steps.length) { autoLayout(); return; }
+  var bottom = 0;
+  S.steps.forEach(function (s) {
+    if (typeof s.y === "number") bottom = Math.max(bottom, s.y);
+  });
+  missing.forEach(function (step, i) { step.x = 20; step.y = bottom + 150 * (i + 1); });
+}
+
+function autoLayout() {
+  var COL = 260, ROW = 150, depth = {}, seen = {};
+  var roots = S.steps.filter(function (s) { return (s.trigger || {}).type !== "none"; });
+  if (!roots.length) roots = S.steps.slice(0, 1);
+  var queue = roots.map(function (s) { return [s, 0]; });
+  while (queue.length) {
+    var pair = queue.shift(), step = pair[0], level = pair[1];
+    if (seen[step.id]) continue;
+    seen[step.id] = true;
+    depth[step.id] = level;
+    outputsOf(step).forEach(function (out) {
+      var next = out.to ? byId(out.to) : null;
+      if (next && !seen[next.id]) queue.push([next, level + 1]);
+    });
+  }
+  var taken = {};
+  S.steps.forEach(function (step) {
+    var level = depth[step.id] || 0;
+    taken[level] = taken[level] || 0;
+    step.x = 20 + level * COL;
+    step.y = 20 + taken[level] * ROW;
+    taken[level]++;
+  });
+}
+
+function applyPan() {
+  document.getElementById("world").style.transform =
+    "translate(" + PAN.x + "px," + PAN.y + "px) scale(" + PAN.z + ")";
+}
+
+function fitView() {
+  var canvas = document.getElementById("canvas");
+  if (!S.steps.length || !canvas.clientWidth) return;
+  var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  S.steps.forEach(function (s) {
+    minX = Math.min(minX, s.x); minY = Math.min(minY, s.y);
+    maxX = Math.max(maxX, s.x + NODE_W); maxY = Math.max(maxY, s.y + 130);
+  });
+  var zoom = Math.min(1, (canvas.clientWidth - 30) / (maxX - minX),
+                         (canvas.clientHeight - 30) / (maxY - minY));
+  PAN.z = Math.max(0.3, zoom);
+  PAN.x = (canvas.clientWidth - (maxX - minX) * PAN.z) / 2 - minX * PAN.z;
+  PAN.y = 15 - minY * PAN.z;
+  applyPan();
+}
+
+function zoomBy(factor) {
+  var canvas = document.getElementById("canvas");
+  var cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2;
+  var wx = (cx - PAN.x) / PAN.z, wy = (cy - PAN.y) / PAN.z;
+  PAN.z = Math.min(2, Math.max(0.3, PAN.z * factor));
+  PAN.x = cx - wx * PAN.z;
+  PAN.y = cy - wy * PAN.z;
+  applyPan();
+}
+
+function wirePath(x1, y1, x2, y2) {
+  var bend = Math.max(35, Math.abs(x2 - x1) / 2);
+  var path = document.createElementNS(SVGNS, "path");
+  path.setAttribute("class", "wire");
+  path.setAttribute("d", "M " + x1 + " " + y1 +
+    " C " + (x1 + bend) + " " + y1 + ", " + (x2 - bend) + " " + y2 +
+    ", " + x2 + " " + y2);
+  return path;
+}
+
+/* Линии рисуем отдельно от блоков: при перетаскивании блок не пересоздаётся,
+   перерисовываются только линии. */
+function drawWires() {
+  var svg = document.getElementById("wires");
+  if (!svg) return;
+  svg.textContent = "";
+  S.steps.forEach(function (step) {
+    var from = NODES[step.id];
+    if (!from) return;
+    outputsOf(step).forEach(function (out, index) {
+      var target = out.to ? byId(out.to) : null;
+      var to = target ? NODES[target.id] : null;
+      if (!to) return;
+      var port = from.querySelector('[data-out="' + index + '"]');
+      if (!port) return;
+      var x1 = step.x + from.offsetWidth;
+      var y1 = step.y + port.offsetTop + port.offsetHeight / 2;
+      var x2 = target.x;
+      var y2 = target.y + to.offsetHeight / 2;
+      svg.append(wirePath(x1, y1, x2, y2));
+      var end = document.createElementNS(SVGNS, "circle");
+      end.setAttribute("class", "wire-end");
+      end.setAttribute("cx", x2);
+      end.setAttribute("cy", y2);
+      end.setAttribute("r", 4);
+      svg.append(end);
+    });
+  });
+}
+
+function nodeEl(step, index) {
+  var node = el("div", {class: "node" + (step.id === OPEN ? " open" : ""),
+                        "data-id": step.id});
+  node.style.left = step.x + "px";
+  node.style.top = step.y + "px";
+
+  var trigger = step.trigger || {};
+  var badge = trigger.type === "command" ? (trigger.value || "команда")
+            : trigger.type === "text" ? "фраза: " + (trigger.value || "")
+            : trigger.type === "any" ? "любое сообщение" : "";
+
+  node.append(el("div", {class: "node-head"},
+    el("span", {class: "node-num"}, index + 1),
+    el("span", {class: "node-name"}, titleOf(step, index)),
+    step.kind === "ask" ? el("span", {class: "node-kind"}, "вопрос") : null));
+  if (badge) node.append(el("div", {class: "node-badge"}, badge));
+  node.append(el("div", {class: "node-text"},
+    (step.text || "без текста").slice(0, 80)));
+
+  outputsOf(step).forEach(function (out, oi) {
+    var port = el("div", {class: "port", "data-out": oi},
+      el("span", {}, out.label));
+    var lit = LINKING && LINKING.id === step.id && LINKING.out === oi;
+    var dot = el("span", {class: "dot" + (out.kind === "url" ? " dot-url" : "") +
+                                 (lit ? " armed" : "")});
+    if (out.kind !== "url") {
+      /* Кружок не должен таскать блок — гасим начало перетаскивания. */
+      dot.addEventListener("pointerdown", function (e) { e.stopPropagation(); });
+      dot.addEventListener("click", function (e) {
+        e.stopPropagation();
+        armPort(step, oi);
+      });
+    }
+    port.append(dot);
+    node.append(port);
+  });
+
+  attachDrag(node, step);
+  return node;
+}
+
+function attachDrag(node, step) {
+  var grab = null;
+  node.addEventListener("pointerdown", function (e) {
+    if (e.button === 1 || e.button === 2) return;
+    e.stopPropagation();                     /* иначе поедет всё полотно */
+    grab = {x: e.clientX, y: e.clientY, sx: step.x, sy: step.y, moved: false};
+    try { node.setPointerCapture(e.pointerId); } catch (err) {}
+    node.classList.add("dragging");
+  });
+  node.addEventListener("pointermove", function (e) {
+    if (!grab) return;
+    var dx = (e.clientX - grab.x) / PAN.z, dy = (e.clientY - grab.y) / PAN.z;
+    if (!grab.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+    grab.moved = true;
+    step.x = Math.round(grab.sx + dx);
+    step.y = Math.round(grab.sy + dy);
+    node.style.left = step.x + "px";
+    node.style.top = step.y + "px";
+    drawWires();
+  });
+  node.addEventListener("pointerup", function (e) {
+    if (!grab) return;
+    var moved = grab.moved;
+    grab = null;
+    node.classList.remove("dragging");
+    if (moved) { touch(); return; }          /* блок просто передвинули */
+    if (LINKING) { linkTo(step); return; }   /* ждали, куда вести стрелку */
+    OPEN = step.id;                          /* обычное касание — правка */
+    renderCanvas();
+    renderSheet();
+  });
+  node.addEventListener("pointercancel", function () {
+    grab = null;
+    node.classList.remove("dragging");
+  });
+}
+
+function armPort(step, outIndex) {
+  var same = LINKING && LINKING.id === step.id && LINKING.out === outIndex;
+  LINKING = same ? null : {id: step.id, out: outIndex};
+  renderCanvas();
+}
+
+function linkTo(target) {
+  var source = byId(LINKING.id);
+  var output = source ? outputsOf(source)[LINKING.out] : null;
+  if (!output) { LINKING = null; renderCanvas(); return; }
+  var already = output.to === target.id;
+  setLink(source, LINKING.out, already ? "" : target.id);
+  LINKING = null;
+  touch();
+  renderCanvas();
+  setHint(already ? "Стрелка убрана" : "Соединено");
+}
+
+function renderCanvas() {
+  ensurePositions();
+  var world = document.getElementById("world");
+  world.textContent = "";
+  NODES = {};
+
+  var svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("class", "wires");
+  svg.setAttribute("id", "wires");
+  world.append(svg);
+
+  S.steps.forEach(function (step, index) {
+    var node = nodeEl(step, index);
+    world.append(node);
+    NODES[step.id] = node;
+  });
+
+  if (!PAN.ready) { PAN.ready = true; fitView(); } else { applyPan(); }
+  drawWires();                    /* высоты блоков известны только теперь */
+
+  var tip = document.getElementById("linking");
+  tip.hidden = !LINKING;
+  if (LINKING) {
+    var source = byId(LINKING.id);
+    var output = source ? outputsOf(source)[LINKING.out] : null;
+    tip.textContent = output && output.to
+      ? "Коснитесь блока, куда вести. Тот же блок — убрать стрелку."
+      : "Коснитесь блока, куда вести стрелку.";
+  }
+}
+
+/* Полотно: одним пальцем двигаем, двумя — приближаем. */
+function attachCanvas() {
+  var canvas = document.getElementById("canvas");
+  var points = {}, pan = null, pinch = null;
+
+  function ids() { return Object.keys(points); }
+  function gap(a, b) {
+    return Math.hypot(points[a].x - points[b].x, points[a].y - points[b].y);
+  }
+
+  canvas.addEventListener("pointerdown", function (e) {
+    points[e.pointerId] = {x: e.clientX, y: e.clientY};
+    var list = ids();
+    if (list.length === 1) {
+      pan = {x: e.clientX, y: e.clientY, px: PAN.x, py: PAN.y, moved: false};
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    } else if (list.length === 2) {
+      var box = canvas.getBoundingClientRect();
+      var mx = (points[list[0]].x + points[list[1]].x) / 2 - box.left;
+      var my = (points[list[0]].y + points[list[1]].y) / 2 - box.top;
+      pan = null;
+      pinch = {gap: gap(list[0], list[1]), z: PAN.z, box: box,
+               wx: (mx - PAN.x) / PAN.z, wy: (my - PAN.y) / PAN.z};
+    }
+  });
+
+  canvas.addEventListener("pointermove", function (e) {
+    if (!(e.pointerId in points)) return;
+    points[e.pointerId] = {x: e.clientX, y: e.clientY};
+    var list = ids();
+    if (pinch && list.length >= 2) {
+      var now = gap(list[0], list[1]);
+      if (!now) return;
+      PAN.z = Math.min(2, Math.max(0.3, pinch.z * now / pinch.gap));
+      var mx = (points[list[0]].x + points[list[1]].x) / 2 - pinch.box.left;
+      var my = (points[list[0]].y + points[list[1]].y) / 2 - pinch.box.top;
+      PAN.x = mx - pinch.wx * PAN.z;
+      PAN.y = my - pinch.wy * PAN.z;
+      applyPan();
+    } else if (pan) {
+      var dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+      if (!pan.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      pan.moved = true;
+      PAN.x = pan.px + dx;
+      PAN.y = pan.py + dy;
+      applyPan();
+    }
+  });
+
+  function release(e) {
+    delete points[e.pointerId];
+    if (ids().length < 2) pinch = null;
+    if (pan && !pan.moved && LINKING) {  /* мимо блока — стрелку отменяем */
+      LINKING = null;
+      renderCanvas();
+    }
+    if (!ids().length) pan = null;
+  }
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", release);
+
+  canvas.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    var box = canvas.getBoundingClientRect();
+    var mx = e.clientX - box.left, my = e.clientY - box.top;
+    var wx = (mx - PAN.x) / PAN.z, wy = (my - PAN.y) / PAN.z;
+    PAN.z = Math.min(2, Math.max(0.3, PAN.z * (e.deltaY < 0 ? 1.12 : 0.89)));
+    PAN.x = mx - wx * PAN.z;
+    PAN.y = my - wy * PAN.z;
+    applyPan();
+  }, {passive: false});
+
+  /* Кнопки лежат поверх полотна — не даём им сдвигать его. */
+  canvas.querySelector(".tools").addEventListener("pointerdown", function (e) {
+    e.stopPropagation();
+  });
+  document.getElementById("zoomIn").addEventListener("click", function () { zoomBy(1.2); });
+  document.getElementById("zoomOut").addEventListener("click", function () { zoomBy(0.83); });
+  document.getElementById("zoomFit").addEventListener("click", fitView);
+}
+
+/* ---- окно правки шага ---- */
+function renderSheet() {
+  var sheet = document.getElementById("sheet");
+  var index = -1;
+  S.steps.forEach(function (s, i) { if (s.id === OPEN) index = i; });
+  if (index < 0) { OPEN = ""; sheet.hidden = true; return; }
+  sheet.hidden = false;
+  var body = document.getElementById("sheetCard");
+  body.textContent = "";
+  body.append(card(S.steps[index], index));
+}
+
+function closeSheet() {
+  OPEN = "";
+  document.getElementById("sheet").hidden = true;
+  if (VIEW === "canvas") renderCanvas();
+}
+
+function render() {
+  document.getElementById("canvasView").hidden = VIEW !== "canvas";
+  document.getElementById("listView").hidden = VIEW !== "list";
+  document.getElementById("tabCanvas").className = VIEW === "canvas" ? "on" : "";
+  document.getElementById("tabList").className = VIEW === "list" ? "on" : "";
+  if (VIEW === "canvas") renderCanvas(); else renderList();
+  renderSheet();
 }
 
 /* ---- панель бота ---- */
@@ -1342,13 +1809,32 @@ document.getElementById("save").addEventListener("click", async function () {
 });
 
 document.getElementById("add").addEventListener("click", function () {
-  S.steps.push({id: nextId(), name: "", kind: "message",
-                trigger: {type: "none", value: ""}, text: "", photo: "",
-                save_to: "", notify: false, next: "", buttons: []});
+  var step = {id: nextId(), name: "", kind: "message",
+              trigger: {type: "none", value: ""}, text: "", photo: "",
+              save_to: "", notify: false, next: "", buttons: []};
+  if (VIEW === "canvas") {
+    /* Кладём новый блок на середину того, что человек сейчас видит. */
+    var canvas = document.getElementById("canvas");
+    step.x = Math.round((canvas.clientWidth / 2 - PAN.x) / PAN.z - NODE_W / 2);
+    step.y = Math.round((canvas.clientHeight / 2 - PAN.y) / PAN.z - 45);
+    S.steps.push(step);
+    OPEN = step.id;
+  } else {
+    S.steps.push(step);
+  }
   touch();
   render();
-  window.scrollTo(0, document.body.scrollHeight);
+  if (VIEW === "list") window.scrollTo(0, document.body.scrollHeight);
 });
+
+document.getElementById("tabCanvas").addEventListener("click", function () {
+  VIEW = "canvas"; render();
+});
+document.getElementById("tabList").addEventListener("click", function () {
+  VIEW = "list"; render();
+});
+document.getElementById("sheetBg").addEventListener("click", closeSheet);
+document.getElementById("sheetDone").addEventListener("click", closeSheet);
 
 /* ---- старт ---- */
 (async function () {
@@ -1369,6 +1855,7 @@ document.getElementById("add").addEventListener("click", function () {
     boot.hidden = true;
     document.getElementById("app").hidden = false;
     renderBot();
+    attachCanvas();
     render();
     setHint(BOT.connected ? "Бот подключён" : "Подключите бота, чтобы сценарий заработал");
   } catch (e) {

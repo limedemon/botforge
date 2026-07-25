@@ -12,6 +12,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -227,7 +230,23 @@ async def run():
     check("сработал запуск по фразе внутри сообщения",
           sent_texts() == ["Первое", "Второе"], str(sent_texts()))
 
-    print("\n8. Мелочи")
+    print("\n8. Схема: где лежат блоки")
+    placed = {"steps": [
+        {"id": "a", "name": "Старт", "kind": "message", "text": "Меню",
+         "trigger": {"type": "command", "value": "/start"}, "x": 120.5, "y": -40,
+         "buttons": [{"text": "Дальше", "action": "goto", "value": "b"}]},
+        {"id": "b", "name": "Второй", "kind": "message", "text": "Второе",
+         "trigger": {"type": "none", "value": ""}, "x": "не число", "y": 9e9},
+    ]}
+    await client.post("/api/scenario", headers=headers, json={"scenario": placed})
+    resp = await client.get("/api/state", headers=headers)
+    saved = (await resp.json())["scenario"]["steps"]
+    check("координаты блока сохранились",
+          saved[0].get("x") == 120.5 and saved[0].get("y") == -40.0, str(saved[0]))
+    check("мусор вместо координат отброшен",
+          "x" not in saved[1] and "y" not in saved[1], str(saved[1]))
+
+    print("\n9. Мелочи")
     CALLS.clear()
     await client.post(path, json={
         "message": {"chat": {"id": -100, "type": "supergroup"},
@@ -250,7 +269,7 @@ async def run():
     resp = await client.get("/api/state", headers=headers)
     check("после отключения бот отвязан", (await resp.json())["connected"] is False)
 
-    print("\n9. Уборка за собой")
+    print("\n10. Уборка за собой")
     await main.db.execute("DELETE FROM sessions WHERE project_id = $1", project["id"])
     await main.db.execute("DELETE FROM projects WHERE owner_id = $1", 777)
     left = await main.db.fetchrow("SELECT * FROM projects WHERE owner_id = 777")
@@ -261,9 +280,168 @@ async def run():
     main.SQLITE_PATH.unlink(missing_ok=True)
 
 
+# --------------------------------------------------------------------------
+# Проверка редактора. Страница живёт внутри main.py строкой, поэтому вырезаем
+# из неё скрипт и запускаем в Node с подставным браузером. Так проверяется
+# логика схемы: какие у шага выходы, куда ведут стрелки, как раскладываются
+# блоки. Если Node не установлен — просто пропускаем.
+# --------------------------------------------------------------------------
+
+HARNESS = r"""
+"use strict";
+const fs = require("fs");
+const code = fs.readFileSync(process.argv[2], "utf8");
+
+/* Подставной браузер: ровно столько, сколько нужно скрипту, чтобы загрузиться. */
+function node() {
+  const self = {
+    nodeType: 1,
+    className: "", textContent: "", value: "", hidden: false, checked: false,
+    style: {setProperty() {}}, children: [],
+    classList: {add() {}, remove() {}},
+    offsetTop: 0, offsetLeft: 0, offsetWidth: 180, offsetHeight: 90,
+    clientWidth: 360, clientHeight: 480,
+    setAttribute(k, v) { this["attr_" + k] = v; },
+    getAttribute(k) { return this["attr_" + k]; },
+    addEventListener() {}, removeEventListener() {},
+    append(...kids) { this.children.push(...kids); },
+    appendChild(kid) { this.children.push(kid); return kid; },
+    querySelector() { return node(); },
+    getBoundingClientRect() { return {left: 0, top: 0, width: 360, height: 480}; },
+    setPointerCapture() {},
+  };
+  return self;
+}
+const known = {};
+const document = {
+  documentElement: node(),
+  createElement: node,
+  createElementNS: node,
+  createTextNode(text) { return {nodeType: 3, textContent: String(text)}; },
+  getElementById(id) { return known[id] || (known[id] = node()); },
+};
+const window = {addEventListener() {}, scrollTo() {}};
+window.parent = window;
+const location = {hash: "", search: "", href: ""};
+const sessionStorage = {getItem: () => null, setItem() {}};
+const fetch = () => Promise.reject(new Error("сеть в проверке недоступна"));
+
+const api = new Function(
+  "window", "document", "location", "sessionStorage", "fetch", "alert",
+  code + "\nreturn {" +
+  "  getS: () => S, setS: (v) => { S = v; }," +
+  "  outputsOf, setLink, autoLayout, ensurePositions, removeStep," +
+  "  nextId, byId, titleOf, getLinking: () => LINKING" +
+  "};"
+)(window, document, location, sessionStorage, fetch, () => {});
+
+const results = [];
+const check = (name, ok, detail) => results.push({name, ok: !!ok, detail: detail || ""});
+
+/* --- выходы шага --- */
+api.setS({steps: [
+  {id: "a", kind: "message", trigger: {type: "command", value: "/start"},
+   buttons: [{text: "Цены", action: "goto", value: "b"},
+             {text: "Сайт", action: "url", value: "https://x.ru"}]},
+  {id: "b", kind: "message", trigger: {type: "none"}, buttons: [], next: "c"},
+  {id: "c", kind: "ask", trigger: {type: "none"}, buttons: [], next: "a"},
+]});
+const S = api.getS();
+const outs = api.outputsOf(S.steps[0]);
+check("у сообщения с кнопками по выходу на кнопку", outs.length === 2, JSON.stringify(outs));
+check("кнопка-переход знает свою цель", outs[0].to === "b", JSON.stringify(outs[0]));
+check("от кнопки-ссылки стрелку не тянут", outs[1].kind === "url" && outs[1].to === "",
+      JSON.stringify(outs[1]));
+check("у шага без кнопок один выход «далее»",
+      api.outputsOf(S.steps[1]).length === 1 && api.outputsOf(S.steps[1])[0].to === "c");
+check("у вопроса выход после ответа",
+      api.outputsOf(S.steps[2])[0].label === "после ответа");
+
+/* --- соединение --- */
+api.setLink(S.steps[0], 0, "c");
+check("стрелка от кнопки перевесилась", S.steps[0].buttons[0].value === "c");
+api.setLink(S.steps[0], 1, "b");
+check("кнопке-ссылке стрелку не привязать", S.steps[0].buttons[1].value === "https://x.ru");
+api.setLink(S.steps[1], 0, "");
+check("стрелку «далее» можно убрать", S.steps[1].next === "");
+
+/* --- раскладка --- */
+api.setS({steps: [
+  {id: "a", kind: "message", trigger: {type: "command", value: "/start"},
+   buttons: [{text: "к", action: "goto", value: "b"}]},
+  {id: "b", kind: "message", trigger: {type: "none"}, buttons: [], next: "c"},
+  {id: "c", kind: "message", trigger: {type: "none"}, buttons: [], next: ""},
+  {id: "d", kind: "message", trigger: {type: "none"}, buttons: [], next: ""},
+]});
+api.autoLayout();
+const L = api.getS().steps;
+check("цепочка разложена по столбцам", L[0].x < L[1].x && L[1].x < L[2].x,
+      L.map((s) => s.id + ":" + s.x + "," + s.y).join(" "));
+check("оторванный блок не лёг поверх старта",
+      !(L[3].x === L[0].x && L[3].y === L[0].y),
+      L.map((s) => s.id + ":" + s.x + "," + s.y).join(" "));
+const spots = new Set(L.map((s) => s.x + "," + s.y));
+check("два блока не оказались в одной точке", spots.size === L.length);
+
+/* --- места для новых блоков --- */
+api.setS({steps: [
+  {id: "a", kind: "message", trigger: {type: "none"}, buttons: [], x: 10, y: 10},
+  {id: "b", kind: "message", trigger: {type: "none"}, buttons: []},
+]});
+api.ensurePositions();
+const P = api.getS().steps;
+check("готовый блок не сдвинулся", P[0].x === 10 && P[0].y === 10);
+check("новому блоку нашлось место", typeof P[1].x === "number" && P[1].y > P[0].y,
+      JSON.stringify(P[1]));
+
+/* --- удаление шага чистит стрелки --- */
+api.setS({steps: [
+  {id: "a", kind: "message", trigger: {type: "none"}, next: "b",
+   buttons: [{text: "к", action: "goto", value: "b"}], x: 0, y: 0},
+  {id: "b", kind: "message", trigger: {type: "none"}, buttons: [], next: "", x: 0, y: 0},
+]});
+api.removeStep(1);
+const R = api.getS().steps;
+check("после удаления кнопка никуда не ведёт", R[0].buttons[0].value === "");
+check("после удаления «далее» пустое", R[0].next === "");
+check("новый номер шага не совпадает с занятым", api.nextId() !== "s1" || R[0].id !== "s1");
+
+process.stdout.write(JSON.stringify(results));
+"""
+
+
+def check_editor_logic():
+    print("\n11. Схема в редакторе (логика страницы)")
+    if not shutil.which("node"):
+        print("  — пропущено: не установлен Node.js")
+        return
+    js = re.search(r"<script>(.*?)</script>", main.PAGE_HTML, re.S)
+    if not js:
+        check("скрипт страницы найден", False)
+        return
+
+    folder = Path(tempfile.mkdtemp(prefix="botforge_ui_"))
+    try:
+        (folder / "page.js").write_text(js.group(1), encoding="utf-8")
+        (folder / "harness.js").write_text(HARNESS, encoding="utf-8")
+        done = subprocess.run(
+            ["node", str(folder / "harness.js"), str(folder / "page.js")],
+            capture_output=True, text=True, encoding="utf-8", timeout=60,
+        )
+        if done.returncode != 0:
+            check("страница выполняется без ошибок", False,
+                  (done.stderr or done.stdout).strip()[:600])
+            return
+        for item in json.loads(done.stdout):
+            check(item["name"], item["ok"], item["detail"])
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def entry():
     print("Проверка конструктора ботов")
     asyncio.run(run())
+    check_editor_logic()
     print()
     if FAILED:
         print(f"Не прошло проверок: {len(FAILED)}")
