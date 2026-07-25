@@ -98,6 +98,7 @@ MAX_STEPS = 150
 MAX_BUTTONS = 10
 MAX_HOPS = 30                      # защита от схемы, замкнутой на себя
 TAGS_KEY = "#tags"                 # теги лежат среди переменных под этим ключом
+MENU_KEY = "#menu"                 # чьи кнопки сейчас показаны под полем ввода
 
 # Секрет для вебхука самого конструктора — считается из токена,
 # чтобы не заводить ещё одну переменную окружения.
@@ -430,6 +431,7 @@ async def tg(token: str, method: str, **params: Any) -> dict:
     """Вызов метода Bot API. Всегда возвращает словарь, никогда не падает."""
     if not token:
         return {"ok": False, "description": "нет токена"}
+    params = {k: v for k, v in params.items() if v is not None}
     try:
         async with http().post(f"{API}/bot{token}/{method}", json=params) as resp:
             try:
@@ -702,19 +704,39 @@ def remember_user(session: dict, user: dict) -> None:
         session["vars"]["username"] = user["username"]
 
 
-def keyboard_for(step: dict) -> Optional[dict]:
+def keyboard_for(step: dict) -> dict:
+    """Обычная клавиатура — та, что появляется под полем ввода.
+
+    Нажатие такой кнопки приходит боту обычным текстом, поэтому потом мы
+    ищем её по надписи (см. match_menu). Ссылку такая кнопка нести не умеет,
+    это возможно только у кнопок внутри сообщения.
+
+    Если кнопок нет, просим Telegram убрать прежние: иначе под полем ввода
+    так и висели бы кнопки от предыдущего блока.
+    """
     rows = []
     for button in (step.get("buttons") or [])[:MAX_BUTTONS]:
         title = (button.get("text") or "").strip()
-        if not title:
-            continue
-        if button.get("action") == "url":
-            link = (button.get("value") or "").strip()
-            if link.startswith(("http://", "https://", "tg://")):
-                rows.append([{"text": title, "url": link}])
-        else:
-            rows.append([{"text": title, "callback_data": "g:" + (button.get("value") or "")}])
-    return {"inline_keyboard": rows} if rows else None
+        if title:
+            rows.append([{"text": title}])
+    if not rows:
+        return {"remove_keyboard": True}
+    return {"keyboard": rows, "resize_keyboard": True}
+
+
+def match_menu(steps: List[dict], session: dict, text: str) -> Optional[dict]:
+    """Ищет кнопку показанной сейчас клавиатуры по надписи."""
+    menu_id = session.get("vars", {}).get(MENU_KEY) or ""
+    wanted = (text or "").strip().lower()
+    if not menu_id or not wanted:
+        return None
+    step = find_step(steps, menu_id)
+    if not step:
+        return None
+    for button in step.get("buttons") or []:
+        if (button.get("text") or "").strip().lower() == wanted:
+            return button
+    return None
 
 
 def media_kind(message: dict) -> str:
@@ -843,9 +865,8 @@ async def apply_actions(project: dict, chat_id: int, step: dict, session: dict) 
 
 
 async def send_message_step(token: str, chat_id: int, step: dict,
-                            variables: Dict[str, Any]) -> None:
+                            variables: Dict[str, Any], markup: dict) -> None:
     text = fill(step.get("text", ""), variables)
-    markup = keyboard_for(step)
     photo = (step.get("photo") or "").strip()
     document = (step.get("file") or "").strip()
     sent = False
@@ -895,12 +916,19 @@ async def run_step(project: dict, chat_id: int, step_id: str,
         kind = step.get("type")
 
         if kind == "message":
-            await send_message_step(token, chat_id, step, session["vars"])
+            markup = keyboard_for(step)
+            await send_message_step(token, chat_id, step, session["vars"], markup)
+            # Запоминаем, чьи кнопки сейчас под полем ввода: нажатие придёт
+            # обычным текстом, и по нему надо будет узнать кнопку.
+            session["vars"][MENU_KEY] = step["id"] if markup.get("keyboard") else ""
             step_id = step.get("next") or ""
 
         elif kind == "input":
+            # Ждём ответ словами — прежние кнопки только мешают.
             await tg(token, "sendMessage", chat_id=chat_id,
-                     text=(fill(step.get("text", ""), session["vars"]) or "…")[:4096])
+                     text=(fill(step.get("text", ""), session["vars"]) or "…")[:4096],
+                     reply_markup={"remove_keyboard": True})
+            session["vars"][MENU_KEY] = ""
             session["awaiting"] = step["id"]
             await save_session(project["id"], chat_id, session)
             return
@@ -982,7 +1010,22 @@ async def handle_update(project: dict, update: dict) -> None:
     remember_user(session, message.get("from") or {})
     text = (message.get("text") or message.get("caption") or "").strip()
 
-    # 1. Ждём ответ на заданный вопрос.
+    # 1. Нажали кнопку под полем ввода — она приходит обычным текстом.
+    button = match_menu(steps, session, text)
+    if button:
+        if button.get("action") == "url":
+            # Обычная кнопка не умеет быть ссылкой — присылаем её сообщением.
+            link = (button.get("value") or "").strip()
+            await tg(token, "sendMessage", chat_id=chat_id,
+                     text=link or "Ссылка не указана")
+            await save_session(project["id"], chat_id, session)
+        else:
+            session["awaiting"] = ""
+            await run_step(project, chat_id, button.get("value") or "",
+                           scenario, session)
+        return
+
+    # 2. Ждём ответ на заданный вопрос.
     awaiting_id = session.get("awaiting") or ""
     if awaiting_id and text and not text.startswith("/"):
         asked = find_step(steps, awaiting_id)
@@ -1039,14 +1082,32 @@ async def handle_update(project: dict, update: dict) -> None:
     await save_session(project["id"], chat_id, session)
 
 
-async def tick_timers() -> int:
-    """Забирает созревшие таймеры и продолжает схему с их блока."""
+async def claim_timers(limit: int = 20) -> List[dict]:
+    """Забирает созревшие задания себе.
+
+    В Postgres — одним запросом, с удалением: если сервис вдруг окажется
+    запущен в двух экземплярах, каждое задание достанется ровно одному и
+    человек не получит одно сообщение дважды. С файловой базой экземпляр
+    всегда один, там достаточно выбрать и удалить.
+    """
+    now = time.time()
+    if db.pg:
+        return await db.fetch(
+            "DELETE FROM timers WHERE id IN ("
+            " SELECT id FROM timers WHERE run_at <= $1 ORDER BY run_at LIMIT $2"
+            ") RETURNING *", now, limit,
+        )
     due = await db.fetch(
-        "SELECT * FROM timers WHERE run_at <= $1 ORDER BY run_at LIMIT 20",
-        time.time(),
-    )
+        "SELECT * FROM timers WHERE run_at <= $1 ORDER BY run_at LIMIT $2", now, limit)
     for job in due:
         await db.execute("DELETE FROM timers WHERE id = $1", job["id"])
+    return due
+
+
+async def tick_timers() -> int:
+    """Забирает созревшие таймеры и продолжает схему с их блока."""
+    due = await claim_timers()
+    for job in due:
         project = await get_project(job["project_id"])
         if not project or not project["bot_token"]:
             continue
@@ -2344,7 +2405,7 @@ function fieldsMessage(body, step) {
         touch(); renderCanvas(); renderPanel();
       }}, "✕")));
     group.append(el("div", {class: "row", style: "margin-top:6px"},
-      pick([["goto", "ведёт на блок"], ["url", "открывает сайт"]],
+      pick([["goto", "ведёт на блок"], ["url", "присылает ссылку"]],
         button.action || "goto", function (e) {
           button.action = e.target.value;
           button.value = "";
@@ -2368,7 +2429,9 @@ function fieldsMessage(body, step) {
     }}, "+ Добавить кнопку"));
   }
   body.append(el("div", {class: "note"},
-    "Цвет кнопок Telegram не поддерживает — все кнопки выглядят одинаково."));
+    "Кнопки появляются под полем ввода. Такая кнопка не умеет быть ссылкой — " +
+    "поэтому «присылает ссылку» отправляет её отдельным сообщением. " +
+    "Цвет кнопок Telegram не поддерживает."));
 }
 
 function fieldsInput(body, step) {
