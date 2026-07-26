@@ -2365,6 +2365,11 @@ button{cursor:pointer}
 .chip .who span{display:block;font-size:11px;color:var(--soft)}
 .round{flex:none;width:38px;height:38px;border:none;border-radius:12px;background:#fff;
        box-shadow:0 2px 10px rgba(21,40,60,.14);font-size:16px}
+/* Значки — цветными, как в Telegram: без этого шрифта часть систем рисует
+   их чёрно-белым «текстовым» начертанием. */
+.round{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",
+       -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+.round.braces{font-weight:800;font-size:18px;letter-spacing:-.5px}
 .grow{flex:1}
 .save{border:none;border-radius:12px;padding:0 14px;height:38px;font-weight:600;
       background:var(--accent);color:var(--accent-ink);box-shadow:0 2px 10px rgba(21,40,60,.14)}
@@ -2506,9 +2511,9 @@ textarea.inp{min-height:78px;resize:vertical}
   <div class="topbar">
     <button class="chip" id="chip"><span>🤖</span><span class="who" id="chipWho"></span></button>
     <span class="grow"></span>
-    <button class="round" id="peopleBtn" title="Люди">👥</button>
-    <button class="round" id="tagsBtn" title="Теги">🏷</button>
-    <button class="round" id="varsBtn" title="Переменные">{ }</button>
+    <button class="round" id="peopleBtn" title="Люди">👥️</button>
+    <button class="round" id="tagsBtn" title="Теги">🏷️</button>
+    <button class="round braces" id="varsBtn" title="Переменные">{&thinsp;}</button>
     <button class="save" id="save">Сохранить</button>
     <button class="round" id="menuBtn">☰</button>
   </div>
