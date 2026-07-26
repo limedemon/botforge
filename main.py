@@ -97,8 +97,13 @@ INIT_DATA_TTL = 24 * 3600          # сколько живёт подпись м
 MAX_STEPS = 150
 MAX_BUTTONS = 10
 MAX_HOPS = 30                      # защита от схемы, замкнутой на себя
+MAX_ASSETS = 80                    # сколько картинок помещается в галерею
+MAX_ASSET_BYTES = 5 * 1024 * 1024  # и какого размера каждая
+MAX_VARS = 200
+MAX_TAGS = 100
 TAGS_KEY = "#tags"                 # теги лежат среди переменных под этим ключом
 MENU_KEY = "#menu"                 # чьи кнопки сейчас показаны под полем ввода
+RANDOM_KEY = "#rnd:"               # какой вариант рандома уже выпал человеку
 
 # Секрет для вебхука самого конструктора — считается из токена,
 # чтобы не заводить ещё одну переменную окружения.
@@ -126,10 +131,29 @@ TYPES = ("message", "input", "keywords", "event", "action",
 
 EVENTS = ("first", "unknown", "blocked", "unblocked", "photo", "video",
           "file", "location", "voice", "any")
-CONDITION_OPS = ("eq", "ne", "has", "empty", "tag")
-ACTION_KINDS = ("set_var", "del_var", "add_tag", "del_tag", "notify")
+CONDITION_OPS = ("eq", "ne", "has", "empty", "tag", "gt", "lt", "gte", "lte")
+ACTION_KINDS = ("set_var", "add_tag", "del_tag", "notify",
+                "subscribe", "unsubscribe")
 TIMER_UNITS = ("minute", "hour", "day")
 UNIT_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
+
+# --------------------------------------------------------------------------
+# 2а. Переменные и теги — общий список на весь проект
+#
+# Переменная бывает двух видов и двух типов значения:
+#
+#   вид   user    — своё значение у каждого человека (ответы, счётчики)
+#         project — одно значение на всех (цена, название компании)
+#   тип   text    — что угодно: буквы, цифры, знаки
+#         number  — только число; с ним работают + − × ÷
+#
+# Действие «Изменить переменную» у текстовой переменной умеет только «=»:
+# складывать буквы бессмысленно, поэтому остальные знаки для неё закрыты.
+# --------------------------------------------------------------------------
+
+VAR_SCOPES = ("user", "project")
+VAR_TYPES = ("text", "number")
+SET_OPS = ("set", "add", "sub", "mul", "div")
 
 DEFAULT_SCENARIO: Dict[str, Any] = {
     "start": "s1",
@@ -192,9 +216,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id    BIGINT NOT NULL,
     awaiting   TEXT NOT NULL DEFAULT '',
     vars       TEXT NOT NULL DEFAULT '{}',
+    subscribed INTEGER NOT NULL DEFAULT 1,
     updated_at DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (project_id, chat_id)
 );
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS subscribed INTEGER NOT NULL DEFAULT 1;
 CREATE TABLE IF NOT EXISTS timers (
     id         BIGSERIAL PRIMARY KEY,
     project_id BIGINT NOT NULL,
@@ -203,6 +229,34 @@ CREATE TABLE IF NOT EXISTS timers (
     run_at     DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS timers_due ON timers (run_at);
+CREATE TABLE IF NOT EXISTS assets (
+    id         BIGSERIAL PRIMARY KEY,
+    owner_id   BIGINT NOT NULL,
+    token      TEXT NOT NULL UNIQUE,
+    mime       TEXT NOT NULL DEFAULT 'image/jpeg',
+    bytes      BYTEA NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS assets_owner ON assets (owner_id, created_at);
+CREATE TABLE IF NOT EXISTS variables (
+    id         BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    name       TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT 'user',
+    vtype      TEXT NOT NULL DEFAULT 'text',
+    descr      TEXT NOT NULL DEFAULT '',
+    value      TEXT NOT NULL DEFAULT '',
+    archived   INTEGER NOT NULL DEFAULT 0,
+    created_at DOUBLE PRECISION NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variables_name ON variables (project_id, name);
+CREATE TABLE IF NOT EXISTS tags (
+    id         BIGSERIAL PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tags_name ON tags (project_id, name);
 """
 
 DDL_SQLITE = """
@@ -221,6 +275,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id    INTEGER NOT NULL,
     awaiting   TEXT NOT NULL DEFAULT '',
     vars       TEXT NOT NULL DEFAULT '{}',
+    subscribed INTEGER NOT NULL DEFAULT 1,
     updated_at REAL NOT NULL,
     PRIMARY KEY (project_id, chat_id)
 );
@@ -232,7 +287,41 @@ CREATE TABLE IF NOT EXISTS timers (
     run_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS timers_due ON timers (run_at);
+CREATE TABLE IF NOT EXISTS assets (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id   INTEGER NOT NULL,
+    token      TEXT NOT NULL UNIQUE,
+    mime       TEXT NOT NULL DEFAULT 'image/jpeg',
+    bytes      BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS assets_owner ON assets (owner_id, created_at);
+CREATE TABLE IF NOT EXISTS variables (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT 'user',
+    vtype      TEXT NOT NULL DEFAULT 'text',
+    descr      TEXT NOT NULL DEFAULT '',
+    value      TEXT NOT NULL DEFAULT '',
+    archived   INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variables_name ON variables (project_id, name);
+CREATE TABLE IF NOT EXISTS tags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tags_name ON tags (project_id, name);
 """
+
+# Столбцы, дописанные к уже существующим таблицам. У SQLite нет
+# «ADD COLUMN IF NOT EXISTS», поэтому пробуем и молча пропускаем, если он есть.
+SQLITE_PATCHES = (
+    "ALTER TABLE sessions ADD COLUMN subscribed INTEGER NOT NULL DEFAULT 1",
+)
 
 
 class Db:
@@ -312,6 +401,11 @@ class Db:
         self._sqlite = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
         self._sqlite.row_factory = sqlite3.Row
         self._sqlite.executescript(DDL_SQLITE)
+        for patch in SQLITE_PATCHES:
+            try:
+                self._sqlite.execute(patch)
+            except sqlite3.OperationalError:
+                pass                                   # столбец уже на месте
         self._sqlite.commit()
 
     @staticmethod
@@ -391,26 +485,118 @@ async def load_session(project_id: int, chat_id: int) -> dict:
         project_id, chat_id,
     )
     if not row:
-        return {"awaiting": "", "vars": {}, "first": True}
+        blank = {"awaiting": "", "vars": {}, "first": True, "subscribed": True}
+        await attach_registry(project_id, blank)
+        return blank
     try:
         variables = json.loads(row["vars"])
     except (TypeError, ValueError):
         variables = {}
     if not isinstance(variables, dict):
         variables = {}
-    return {"awaiting": row["awaiting"] or "", "vars": variables, "first": False}
+    session = {"awaiting": row["awaiting"] or "", "vars": variables, "first": False,
+               "subscribed": bool(row.get("subscribed", 1))}
+    await attach_registry(project_id, session)
+    return session
 
 
 async def save_session(project_id: int, chat_id: int, session: dict) -> None:
     await db.execute(
-        "INSERT INTO sessions (project_id, chat_id, awaiting, vars, updated_at)"
-        " VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO sessions (project_id, chat_id, awaiting, vars, subscribed, updated_at)"
+        " VALUES ($1, $2, $3, $4, $5, $6)"
         " ON CONFLICT (project_id, chat_id) DO UPDATE SET"
         " awaiting = excluded.awaiting, vars = excluded.vars,"
-        " updated_at = excluded.updated_at",
+        " subscribed = excluded.subscribed, updated_at = excluded.updated_at",
         project_id, chat_id, session.get("awaiting", ""),
-        json.dumps(session.get("vars", {}), ensure_ascii=False), time.time(),
+        json.dumps(session.get("vars", {}), ensure_ascii=False),
+        1 if session.get("subscribed", True) else 0, time.time(),
     )
+
+
+# --------------------------------------------------------------------------
+# 3а. Списки проекта: переменные, теги, картинки
+# --------------------------------------------------------------------------
+
+
+async def list_vars(project_id: int) -> List[dict]:
+    return await db.fetch(
+        "SELECT * FROM variables WHERE project_id = $1 ORDER BY archived, name",
+        project_id,
+    )
+
+
+async def var_registry(project_id: int) -> Dict[str, dict]:
+    """Все переменные проекта: имя -> что это за переменная."""
+    return {row["name"]: row for row in await list_vars(project_id)}
+
+
+async def ensure_var(project_id: int, name: str, scope: str = "user",
+                     vtype: str = "text") -> None:
+    """Заводит переменную, если её ещё нет.
+
+    Имя переменной может появиться прямо на схеме — в блоке «Ввод» или в
+    действии. Чтобы оно не потерялось, такую переменную сразу заносим в
+    общий список: человек увидит её на странице «Переменные».
+    """
+    if not name:
+        return
+    row = await db.fetchrow(
+        "SELECT id FROM variables WHERE project_id = $1 AND name = $2",
+        project_id, name,
+    )
+    if row:
+        return
+    count = await db.fetchrow(
+        "SELECT COUNT(*) AS n FROM variables WHERE project_id = $1", project_id)
+    if (count or {}).get("n", 0) >= MAX_VARS:
+        return
+    await db.execute(
+        "INSERT INTO variables (project_id, name, scope, vtype, descr, value,"
+        " archived, created_at) VALUES ($1, $2, $3, $4, '', '', 0, $5)",
+        project_id, name,
+        scope if scope in VAR_SCOPES else "user",
+        vtype if vtype in VAR_TYPES else "text", time.time(),
+    )
+
+
+async def list_tags(project_id: int) -> List[dict]:
+    return await db.fetch(
+        "SELECT * FROM tags WHERE project_id = $1 ORDER BY name", project_id)
+
+
+async def ensure_tag(project_id: int, name: str) -> None:
+    if not name:
+        return
+    row = await db.fetchrow(
+        "SELECT id FROM tags WHERE project_id = $1 AND name = $2", project_id, name)
+    if row:
+        return
+    count = await db.fetchrow(
+        "SELECT COUNT(*) AS n FROM tags WHERE project_id = $1", project_id)
+    if (count or {}).get("n", 0) >= MAX_TAGS:
+        return
+    await db.execute(
+        "INSERT INTO tags (project_id, name, created_at) VALUES ($1, $2, $3)",
+        project_id, name, time.time(),
+    )
+
+
+async def save_asset(owner_id: int, blob: bytes, mime: str) -> str:
+    """Кладёт картинку в галерею владельца и возвращает её метку."""
+    token = secrets.token_urlsafe(16)
+    await db.execute(
+        "INSERT INTO assets (owner_id, token, mime, bytes, created_at)"
+        " VALUES ($1, $2, $3, $4, $5)",
+        owner_id, token, mime, blob, time.time(),
+    )
+    # Галерея не резиновая: самые старые вытесняются новыми.
+    extra = await db.fetch(
+        "SELECT token FROM assets WHERE owner_id = $1 ORDER BY created_at DESC",
+        owner_id,
+    )
+    for old in extra[MAX_ASSETS:]:
+        await db.execute("DELETE FROM assets WHERE token = $1", old["token"])
+    return token
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +629,22 @@ async def tg(token: str, method: str, **params: Any) -> dict:
         return {"ok": False, "description": f"нет связи с Telegram: {exc}"}
 
 
+async def tg_download(token: str, file_id: str) -> bytes:
+    """Скачивает присланный файл. Пустые байты — значит не получилось."""
+    info = await tg(token, "getFile", file_id=file_id)
+    path = ((info.get("result") or {}).get("file_path") or "")
+    if not path:
+        return b""
+    try:
+        async with http().get(f"{API}/file/bot{token}/{path}") as resp:
+            if resp.status != 200:
+                return b""
+            blob = await resp.content.read(MAX_ASSET_BYTES + 1)
+            return b"" if len(blob) > MAX_ASSET_BYTES else blob
+    except Exception:
+        return b""
+
+
 async def set_webhook(token: str, url: str, secret: str) -> dict:
     return await tg(
         token, "setWebhook", url=url, secret_token=secret,
@@ -464,8 +666,17 @@ def _text(value: Any, limit: int) -> str:
 
 
 def _name(value: Any) -> str:
-    """Имя переменной или тега: буквы, цифры и подчёркивание."""
-    return re.sub(r"[^\w]", "", str(value or ""), flags=re.UNICODE)[:40]
+    """Имя переменной или тега: буквы, цифры, пробел и подчёркивание."""
+    text = re.sub(r"[^\w ]", "", str(value or ""), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()[:40]
+
+
+def _media(value: Any) -> str:
+    """Картинка или файл: либо метка из галереи, либо обычная ссылка."""
+    text = _text(value, 500).strip()
+    if re.fullmatch(r"asset:[A-Za-z0-9_-]{1,64}", text):
+        return text
+    return text if text.startswith(("http://", "https://")) else ""
 
 
 def clean_scenario(raw: Any) -> dict:
@@ -498,8 +709,9 @@ def clean_scenario(raw: Any) -> dict:
 
         if kind == "message":
             step["text"] = _text(item.get("text"), 3000)
-            step["photo"] = _text(item.get("photo"), 500)
-            step["file"] = _text(item.get("file"), 500)
+            step["photo"] = _media(item.get("photo"))
+            step["file"] = _media(item.get("file"))
+            step["inline"] = bool(item.get("inline"))
             step["buttons"] = [
                 {
                     "text": _text(b.get("text"), 64),
@@ -513,6 +725,8 @@ def clean_scenario(raw: Any) -> dict:
         elif kind == "input":
             step["text"] = _text(item.get("text"), 3000)
             step["save_to"] = _name(item.get("save_to"))
+            step["expect"] = "number" if item.get("expect") == "number" else "any"
+            step["retry"] = _text(item.get("retry"), 500)
 
         elif kind == "keywords":
             step["match"] = "exact" if item.get("match") == "exact" else "contains"
@@ -527,9 +741,11 @@ def clean_scenario(raw: Any) -> dict:
             for a in (item.get("actions") or [])[:10]:
                 if not isinstance(a, dict) or a.get("kind") not in ACTION_KINDS:
                     continue
+                op = a.get("op")
                 step["actions"].append({
                     "kind": a["kind"],
                     "name": _name(a.get("name")),
+                    "op": op if op in SET_OPS else "set",
                     "value": _text(a.get("value"), 500),
                 })
 
@@ -547,8 +763,9 @@ def clean_scenario(raw: Any) -> dict:
             step["otherwise"] = _text(item.get("otherwise"), 40)
 
         elif kind == "random":
+            step["always"] = bool(item.get("always"))
             step["options"] = []
-            for o in (item.get("options") or [])[:10]:
+            for o in (item.get("options") or [])[:6]:
                 if not isinstance(o, dict):
                     continue
                 weight = o.get("weight")
@@ -585,6 +802,26 @@ def clean_scenario(raw: Any) -> dict:
     return {"start": start, "steps": steps}
 
 
+def refresh_actions(raw: dict) -> dict:
+    """Подтягивает старые действия под нынешний набор.
+
+    Раньше «удалить переменную» было отдельным действием — теперь это то же
+    «Изменить переменную», только с пустым значением. И у каждого действия
+    появился знак: «=», «+», «−», «×», «÷».
+    """
+    for step in raw.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for action in step.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            if action.get("kind") == "del_var":
+                action["kind"] = "set_var"
+                action["value"] = ""
+            action.setdefault("op", "set")
+    return raw
+
+
 def migrate_scenario(raw: Any) -> dict:
     """Переводит схему из первой версии (шаги с триггерами) в блоки.
 
@@ -595,7 +832,7 @@ def migrate_scenario(raw: Any) -> dict:
     if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
         return dict(DEFAULT_SCENARIO)
     if any(isinstance(s, dict) and s.get("type") in TYPES for s in raw["steps"]):
-        return raw                              # уже новый формат
+        return refresh_actions(raw)             # уже новый формат
 
     steps, extra, start = [], [], ""
     for old in raw["steps"]:
@@ -676,12 +913,103 @@ def load_scenario(project: dict) -> dict:
 # 6. Движок: как схема превращается в поведение бота
 # --------------------------------------------------------------------------
 
-VAR_RE = re.compile(r"\{(\w+)\}", re.UNICODE)
+# Имя переменной может быть из нескольких слов — «{КЛИК за всё время}».
+# Скобки с чем-то другим внутри (смайлик, знак) под это не подходят и
+# остаются в тексте как есть.
+VAR_RE = re.compile(r"\{([\w ]{1,40})\}", re.UNICODE)
 
 
 def fill(text: str, variables: Dict[str, Any]) -> str:
     """Подставляет в текст значения переменных: {имя} -> Иван."""
     return VAR_RE.sub(lambda m: str(variables.get(m.group(1), "")), text or "")
+
+
+def as_number(value: Any) -> float:
+    """Число из чего угодно. «12 руб» -> 12, пусто -> 0."""
+    text = str(value if value is not None else "").replace(",", ".").strip()
+    found = re.search(r"-?\d+(?:\.\d+)?", text)
+    try:
+        return float(found.group(0)) if found else 0.0
+    except ValueError:
+        return 0.0
+
+
+def calculate(text: str) -> Optional[float]:
+    """Считает выражение из чисел и знаков + − × ÷ со скобками.
+
+    Нужно, чтобы в значении можно было написать «{счёт} + 1»: переменные
+    к этому месту уже заменены на числа. Если это не похоже на выражение,
+    возвращаем None — значит, значение возьмут как есть.
+    """
+    source = (text or "")
+    for was, now in (("×", "*"), ("÷", "/"), ("−", "-"), ("–", "-"), (",", ".")):
+        source = source.replace(was, now)
+    if not source.strip() or not re.fullmatch(r"[\d\s.+\-*/()]+", source):
+        return None
+
+    tokens = re.findall(r"\d+(?:\.\d+)?|[+\-*/()]", source)
+    place = 0
+
+    def peek() -> str:
+        return tokens[place] if place < len(tokens) else ""
+
+    def take() -> str:
+        nonlocal place
+        place += 1
+        return tokens[place - 1]
+
+    def atom() -> float:
+        token = peek()
+        if token == "(":
+            take()
+            value = summa()
+            if peek() == ")":
+                take()
+            return value
+        if token == "-":
+            take()
+            return -atom()
+        if token == "+":
+            take()
+            return atom()
+        if re.fullmatch(r"\d+(?:\.\d+)?", token):
+            return float(take())
+        raise ValueError("не выражение")
+
+    def product() -> float:
+        value = atom()
+        while peek() in ("*", "/"):
+            sign, right = take(), atom()
+            value = value * right if sign == "*" else (value / right if right else value)
+        return value
+
+    def summa() -> float:
+        value = product()
+        while peek() in ("+", "-"):
+            sign, right = take(), product()
+            value = value + right if sign == "+" else value - right
+        return value
+
+    try:
+        result = summa()
+    except (ValueError, IndexError, ZeroDivisionError, OverflowError):
+        return None
+    return result if place == len(tokens) else None
+
+
+def looks_like_number(text: str) -> bool:
+    """Правда ли, что человек написал именно число, а не «примерно пять»."""
+    return bool(re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?", (text or "").strip()))
+
+
+def show_number(value: float) -> str:
+    """Число обратно в текст: 12.0 -> «12», 12.5 -> «12.5»."""
+    if value != value or value in (float("inf"), float("-inf")):
+        return "0"
+    rounded = round(value, 6)
+    if rounded == int(rounded):
+        return str(int(rounded))
+    return ("%.6f" % rounded).rstrip("0").rstrip(".")
 
 
 def find_step(steps: List[dict], step_id: str) -> Optional[dict]:
@@ -696,6 +1024,44 @@ def tags_of(session: dict) -> List[str]:
     return list(tags) if isinstance(tags, list) else []
 
 
+async def attach_registry(project_id: int, session: dict) -> None:
+    """Кладёт рядом с сеансом список переменных проекта.
+
+    Проектные переменные — общие для всех, они лежат в базе, а не в сеансе.
+    Читаем их один раз на весь разбор сообщения.
+    """
+    meta, shared = {}, {}
+    for row in await list_vars(project_id):
+        meta[row["name"]] = {"scope": row["scope"], "vtype": row["vtype"]}
+        if row["scope"] == "project":
+            shared[row["name"]] = row["value"]
+    session["reg"] = {"meta": meta, "project": shared}
+
+
+def all_vars(session: dict) -> Dict[str, Any]:
+    """Что можно подставить в текст: общие переменные плюс личные."""
+    shared = (session.get("reg") or {}).get("project") or {}
+    return dict(shared, **session.get("vars", {}))
+
+
+def var_kind(session: dict, name: str) -> tuple:
+    meta = ((session.get("reg") or {}).get("meta") or {}).get(name) or {}
+    return meta.get("scope") or "user", meta.get("vtype") or "text"
+
+
+async def write_var(project: dict, session: dict, name: str, value: str) -> None:
+    """Пишет значение туда, где эта переменная живёт."""
+    scope, _ = var_kind(session, name)
+    if scope == "project":
+        (session.setdefault("reg", {}).setdefault("project", {}))[name] = value
+        await db.execute(
+            "UPDATE variables SET value = $1 WHERE project_id = $2 AND name = $3",
+            value, project["id"], name,
+        )
+    else:
+        session.setdefault("vars", {})[name] = value
+
+
 def remember_user(session: dict, user: dict) -> None:
     """Кладёт имя и ник в переменные, чтобы их можно было вставлять в текст."""
     if user.get("first_name"):
@@ -704,19 +1070,39 @@ def remember_user(session: dict, user: dict) -> None:
         session["vars"]["username"] = user["username"]
 
 
-def keyboard_for(step: dict) -> dict:
-    """Обычная клавиатура — та, что появляется под полем ввода.
+def keyboard_for(step: dict, variables: Optional[Dict[str, Any]] = None) -> dict:
+    """Кнопки сообщения — под полем ввода или внутри самого сообщения.
 
-    Нажатие такой кнопки приходит боту обычным текстом, поэтому потом мы
-    ищем её по надписи (см. match_menu). Ссылку такая кнопка нести не умеет,
-    это возможно только у кнопок внутри сообщения.
+    Под полем ввода (обычная клавиатура): нажатие приходит боту простым
+    текстом, поэтому потом мы ищем кнопку по надписи (см. match_menu).
+    Ссылку такая кнопка нести не умеет.
+
+    Внутри сообщения (галочка «кнопки внутри сообщения»): нажатие приходит
+    отдельным событием, и такая кнопка умеет быть настоящей ссылкой.
 
     Если кнопок нет, просим Telegram убрать прежние: иначе под полем ввода
     так и висели бы кнопки от предыдущего блока.
     """
+    variables = variables or {}
+    buttons = (step.get("buttons") or [])[:MAX_BUTTONS]
+
+    if step.get("inline"):
+        rows = []
+        for button in buttons:
+            title = fill((button.get("text") or "").strip(), variables)
+            if not title:
+                continue
+            value = (button.get("value") or "").strip()
+            if button.get("action") == "url":
+                if value.startswith(("http://", "https://", "tg://")):
+                    rows.append([{"text": title, "url": value}])
+            else:
+                rows.append([{"text": title, "callback_data": "g:" + value[:60]}])
+        return {"inline_keyboard": rows} if rows else {}
+
     rows = []
-    for button in (step.get("buttons") or [])[:MAX_BUTTONS]:
-        title = (button.get("text") or "").strip()
+    for button in buttons:
+        title = fill((button.get("text") or "").strip(), variables)
         if title:
             rows.append([{"text": title}])
     if not rows:
@@ -733,8 +1119,10 @@ def match_menu(steps: List[dict], session: dict, text: str) -> Optional[dict]:
     step = find_step(steps, menu_id)
     if not step:
         return None
+    variables = all_vars(session)
     for button in step.get("buttons") or []:
-        if (button.get("text") or "").strip().lower() == wanted:
+        title = fill((button.get("text") or "").strip(), variables)
+        if title.strip().lower() == wanted:
             return button
     return None
 
@@ -789,7 +1177,7 @@ def match_keywords(steps: List[dict], text: str) -> Optional[dict]:
 
 def condition_holds(step: dict, session: dict) -> bool:
     """Все проверки блока «Условие» должны сойтись, иначе идём по «Нет»."""
-    variables = session.get("vars", {})
+    variables = all_vars(session)
     tags = tags_of(session)
     for check in step.get("checks") or []:
         current = str(variables.get(check.get("var") or "", "")).strip()
@@ -805,31 +1193,58 @@ def condition_holds(step: dict, session: dict) -> bool:
             return False
         if op == "tag" and wanted not in tags:
             return False
+        # Сравнение чисел: «12» меньше «9» только по алфавиту, поэтому
+        # для «больше» и «меньше» обе стороны переводим в числа.
+        if op in ("gt", "lt", "gte", "lte"):
+            left, right = as_number(current), as_number(wanted)
+            if op == "gt" and not left > right:
+                return False
+            if op == "lt" and not left < right:
+                return False
+            if op == "gte" and not left >= right:
+                return False
+            if op == "lte" and not left <= right:
+                return False
     return True
 
 
-def pick_random(step: dict) -> str:
-    """Выбирает вариант с учётом весов. Вариант без стрелки не участвует."""
+def pick_random(step: dict, session: dict) -> str:
+    """Выбирает вариант с учётом весов. Вариант без стрелки не участвует.
+
+    Обычно выпавший вариант закрепляется за человеком: если ему один раз
+    выпало «A», то же выпадет и в следующий раз — так делают A/B-проверки.
+    Галочка «выбирать заново каждый раз» это отключает.
+    """
     options = [o for o in (step.get("options") or []) if o.get("next")]
     if not options:
         return ""
+
+    memory = session.setdefault("vars", {})
+    key = RANDOM_KEY + (step.get("id") or "")
+    if not step.get("always"):
+        was = memory.get(key)
+        if was and any(o["next"] == was for o in options):
+            return was
+
     total = sum(max(0, o.get("weight") or 0) for o in options)
     if total <= 0:
-        return random.choice(options)["next"]
-    point = random.uniform(0, total)
-    running = 0.0
-    for option in options:
-        running += max(0, option.get("weight") or 0)
-        if point <= running:
-            return option["next"]
-    return options[-1]["next"]
+        chosen = random.choice(options)["next"]
+    else:
+        point, running, chosen = random.uniform(0, total), 0.0, options[-1]["next"]
+        for option in options:
+            running += max(0, option.get("weight") or 0)
+            if point <= running:
+                chosen = option["next"]
+                break
+    memory[key] = chosen
+    return chosen
 
 
 async def notify_owner(project: dict, chat_id: int, session: dict, note: str = "") -> None:
     """Присылает владельцу заявку — в его чат с ботом-конструктором."""
     variables = session.get("vars", {})
     lines = [f"{key}: {value}" for key, value in variables.items()
-             if key not in ("name", "username") and key != TAGS_KEY]
+             if key not in ("name", "username") and not str(key).startswith("#")]
     who = variables.get("name", "") or "клиент"
     if variables.get("username"):
         who += f" (@{variables['username']})"
@@ -846,11 +1261,10 @@ async def apply_actions(project: dict, chat_id: int, step: dict, session: dict) 
     for action in step.get("actions") or []:
         kind = action.get("kind")
         name = action.get("name") or ""
-        value = fill(action.get("value") or "", variables)
+        value = fill(action.get("value") or "", all_vars(session))
         if kind == "set_var" and name:
-            variables[name] = value[:500]
-        elif kind == "del_var" and name:
-            variables.pop(name, None)
+            await write_var(project, session, name,
+                            new_value(session, name, action.get("op"), value))
         elif kind == "add_tag":
             tag = name or value.strip()
             if tag and tag not in tags:
@@ -861,31 +1275,90 @@ async def apply_actions(project: dict, chat_id: int, step: dict, session: dict) 
                 tags.remove(tag)
         elif kind == "notify":
             await notify_owner(project, chat_id, session, value)
+        elif kind == "subscribe":
+            session["subscribed"] = True
+        elif kind == "unsubscribe":
+            session["subscribed"] = False
     variables[TAGS_KEY] = tags
+
+
+def new_value(session: dict, name: str, op: str, value: str) -> str:
+    """Считает новое значение переменной с учётом её типа и знака.
+
+    У текстовой переменной знак всегда «=»: складывать и умножать буквы
+    не получится. У числовой пустое значение считается нулём.
+    """
+    _, vtype = var_kind(session, name)
+    op = op if op in SET_OPS else "set"
+    if vtype != "number":
+        return str(value)[:500]
+
+    was = as_number(all_vars(session).get(name, 0))
+    counted = calculate(value)
+    add = counted if counted is not None else as_number(value)
+    if op == "set":
+        return show_number(add)
+    if op == "add":
+        return show_number(was + add)
+    if op == "sub":
+        return show_number(was - add)
+    if op == "mul":
+        return show_number(was * add)
+    if op == "div":
+        return show_number(was / add) if add else show_number(was)
+    return show_number(add)
+
+
+def media_url(value: str) -> str:
+    """Адрес картинки: из галереи или обычная ссылка.
+
+    Картинки из галереи лежат у нас в базе и отдаются по своему адресу —
+    Telegram забирает их оттуда сам.
+    """
+    text = (value or "").strip()
+    if text.startswith("asset:"):
+        return f"{PUBLIC_URL}/img/{text[6:]}"
+    return text if text.startswith(("http://", "https://")) else ""
+
+
+async def tg_text(token: str, method: str, **params: Any) -> dict:
+    """Отправка с разметкой <b>, <i>, <code>.
+
+    Если в тексте окажется одинокая угловая скобка, Telegram откажется его
+    разбирать. Тогда шлём заново как есть: лучше сообщение без оформления,
+    чем молчание бота.
+    """
+    result = await tg(token, method, parse_mode="HTML", **params)
+    if not result.get("ok") and "parse" in str(result.get("description", "")).lower():
+        result = await tg(token, method, **params)
+    return result
 
 
 async def send_message_step(token: str, chat_id: int, step: dict,
                             variables: Dict[str, Any], markup: dict) -> None:
     text = fill(step.get("text", ""), variables)
-    photo = (step.get("photo") or "").strip()
-    document = (step.get("file") or "").strip()
+    photo = media_url(step.get("photo"))
+    document = media_url(step.get("file"))
+    markup = markup or None
     sent = False
 
-    if photo.startswith(("http://", "https://")):
-        result = await tg(token, "sendPhoto", chat_id=chat_id, photo=photo,
-                          caption=text[:1024],
-                          reply_markup=None if document else markup)
+    if photo:
+        result = await tg_text(token, "sendPhoto", chat_id=chat_id, photo=photo,
+                               caption=text[:1024],
+                               reply_markup=None if document else markup)
         sent = bool(result.get("ok"))
 
-    if document.startswith(("http://", "https://")):
-        result = await tg(token, "sendDocument", chat_id=chat_id, document=document,
-                          caption="" if sent else text[:1024], reply_markup=markup)
+    if document:
+        result = await tg_text(token, "sendDocument", chat_id=chat_id,
+                               document=document,
+                               caption="" if sent else text[:1024],
+                               reply_markup=markup)
         sent = sent or bool(result.get("ok"))
 
     if not sent:
         # Ни картинки, ни файла — или Telegram не принял ссылку.
-        await tg(token, "sendMessage", chat_id=chat_id,
-                 text=(text or "…")[:4096], reply_markup=markup)
+        await tg_text(token, "sendMessage", chat_id=chat_id,
+                      text=(text or "…")[:4096], reply_markup=markup)
 
 
 async def schedule_timer(project: dict, chat_id: int, step: dict) -> None:
@@ -916,8 +1389,9 @@ async def run_step(project: dict, chat_id: int, step_id: str,
         kind = step.get("type")
 
         if kind == "message":
-            markup = keyboard_for(step)
-            await send_message_step(token, chat_id, step, session["vars"], markup)
+            variables = all_vars(session)
+            markup = keyboard_for(step, variables)
+            await send_message_step(token, chat_id, step, variables, markup)
             # Запоминаем, чьи кнопки сейчас под полем ввода: нажатие придёт
             # обычным текстом, и по нему надо будет узнать кнопку.
             session["vars"][MENU_KEY] = step["id"] if markup.get("keyboard") else ""
@@ -926,7 +1400,7 @@ async def run_step(project: dict, chat_id: int, step_id: str,
         elif kind == "input":
             # Ждём ответ словами — прежние кнопки только мешают.
             await tg(token, "sendMessage", chat_id=chat_id,
-                     text=(fill(step.get("text", ""), session["vars"]) or "…")[:4096],
+                     text=(fill(step.get("text", ""), all_vars(session)) or "…")[:4096],
                      reply_markup={"remove_keyboard": True})
             session["vars"][MENU_KEY] = ""
             session["awaiting"] = step["id"]
@@ -942,7 +1416,7 @@ async def run_step(project: dict, chat_id: int, step_id: str,
                        else step.get("otherwise")) or ""
 
         elif kind == "random":
-            step_id = pick_random(step)
+            step_id = pick_random(step, session)
 
         elif kind == "timer":
             await schedule_timer(project, chat_id, step)
@@ -1029,15 +1503,27 @@ async def handle_update(project: dict, update: dict) -> None:
     awaiting_id = session.get("awaiting") or ""
     if awaiting_id and text and not text.startswith("/"):
         asked = find_step(steps, awaiting_id)
-        session["awaiting"] = ""
         if asked:
+            # Ждали число, а пришли буквы — переспрашиваем, не сходя с места.
+            if asked.get("expect") == "number" and not looks_like_number(text):
+                retry = fill(asked.get("retry") or "", all_vars(session))
+                await tg_text(token, "sendMessage", chat_id=chat_id,
+                              text=(retry or "Нужно число. Напишите цифрами.")[:4096])
+                await save_session(project["id"], chat_id, session)
+                return
+
+            session["awaiting"] = ""
             name = (asked.get("save_to") or "").strip()
             if name:
-                session["vars"][name] = text[:500]
+                _, vtype = var_kind(session, name)
+                await write_var(project, session, name,
+                                show_number(as_number(text)) if vtype == "number"
+                                else text[:500])
             await save_session(project["id"], chat_id, session)
             await run_step(project, chat_id, asked.get("next") or "",
                            scenario, session)
             return
+        session["awaiting"] = ""
 
     # 2. Команда запуска.
     if text.lower().startswith("/start"):
@@ -1214,7 +1700,34 @@ async def api_state(request: web.Request) -> web.Response:
         "bot_username": project["bot_username"],
         "first_name": user.get("first_name", ""),
         "people": (row or {}).get("n", 0),
+        "vars": [short_var(v) for v in await list_vars(project["id"])],
+        "tags": [t["name"] for t in await list_tags(project["id"])],
     })
+
+
+def short_var(row: dict) -> dict:
+    return {"name": row["name"], "scope": row["scope"], "vtype": row["vtype"],
+            "descr": row["descr"], "value": row["value"],
+            "archived": bool(row["archived"])}
+
+
+async def register_names(project_id: int, scenario: dict) -> None:
+    """Заводит переменные и теги, которые человек написал прямо на схеме."""
+    for step in scenario.get("steps") or []:
+        if step.get("type") == "input" and step.get("save_to"):
+            await ensure_var(project_id, step["save_to"], "user",
+                             "number" if step.get("expect") == "number" else "text")
+        for action in step.get("actions") or []:
+            if action.get("kind") == "set_var" and action.get("name"):
+                await ensure_var(project_id, action["name"], "user",
+                                 "number" if action.get("op") != "set" else "text")
+            if action.get("kind") in ("add_tag", "del_tag") and action.get("name"):
+                await ensure_tag(project_id, action["name"])
+        for check in step.get("checks") or []:
+            if check.get("op") == "tag":
+                await ensure_tag(project_id, _name(check.get("value")))
+            elif check.get("var"):
+                await ensure_var(project_id, check["var"])
 
 
 async def api_save(request: web.Request) -> web.Response:
@@ -1225,7 +1738,12 @@ async def api_save(request: web.Request) -> web.Response:
         "UPDATE projects SET scenario = $1, updated_at = $2 WHERE id = $3",
         json.dumps(scenario, ensure_ascii=False), time.time(), project["id"],
     )
-    return web.json_response({"ok": True, "steps": len(scenario["steps"])})
+    await register_names(project["id"], scenario)
+    return web.json_response({
+        "ok": True, "steps": len(scenario["steps"]),
+        "vars": [short_var(v) for v in await list_vars(project["id"])],
+        "tags": [t["name"] for t in await list_tags(project["id"])],
+    })
 
 
 async def api_connect(request: web.Request) -> web.Response:
@@ -1277,14 +1795,304 @@ async def api_disconnect(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# --------------------------------------------------------------------------
+# 8а. Галерея картинок
+# --------------------------------------------------------------------------
+
+
+async def api_assets(request: web.Request) -> web.Response:
+    _, user = await current_project(request)
+    rows = await db.fetch(
+        "SELECT token, mime, created_at FROM assets WHERE owner_id = $1"
+        " ORDER BY created_at DESC", int(user["id"]),
+    )
+    return web.json_response({"assets": [
+        {"token": r["token"], "created_at": r["created_at"]} for r in rows]})
+
+
+async def api_asset_delete(request: web.Request) -> web.Response:
+    _, user = await current_project(request)
+    body = await request.json()
+    await db.execute("DELETE FROM assets WHERE owner_id = $1 AND token = $2",
+                     int(user["id"]), str(body.get("token", ""))[:64])
+    return web.json_response({"ok": True})
+
+
+async def page_image(request: web.Request) -> web.Response:
+    """Отдаёт картинку из галереи.
+
+    Подписи тут нет и быть не может: за картинкой приходит сам Telegram,
+    а не человек. Вместо подписи — длинная случайная метка в адресе.
+    """
+    token = request.match_info["token"].split(".")[0][:64]
+    row = await db.fetchrow("SELECT mime, bytes FROM assets WHERE token = $1", token)
+    if not row:
+        raise web.HTTPNotFound(text="нет такой картинки")
+    return web.Response(
+        body=bytes(row["bytes"]), content_type=row["mime"] or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
+# --------------------------------------------------------------------------
+# 8б. Переменные, теги, люди, рассылка
+# --------------------------------------------------------------------------
+
+
+async def api_vars(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    return web.json_response(
+        {"vars": [short_var(v) for v in await list_vars(project["id"])]})
+
+
+async def api_var_save(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    body = await request.json()
+    name = _name(body.get("name"))
+    if not name:
+        raise web.HTTPBadRequest(text="Не указано название переменной")
+
+    was = _name(body.get("was")) or name
+    scope = body.get("scope") if body.get("scope") in VAR_SCOPES else "user"
+    vtype = body.get("vtype") if body.get("vtype") in VAR_TYPES else "text"
+    descr = _text(body.get("descr"), 300)
+    value = _text(body.get("value"), 500)
+    if vtype == "number":
+        value = show_number(as_number(value)) if value.strip() else ""
+    archived = 1 if body.get("archived") else 0
+
+    old = await db.fetchrow(
+        "SELECT * FROM variables WHERE project_id = $1 AND name = $2",
+        project["id"], was)
+    twin = await db.fetchrow(
+        "SELECT * FROM variables WHERE project_id = $1 AND name = $2",
+        project["id"], name)
+    if twin and (not old or twin["id"] != old["id"]):
+        raise web.HTTPBadRequest(text="Переменная с таким названием уже есть")
+
+    if old:
+        await db.execute(
+            "UPDATE variables SET name = $1, scope = $2, vtype = $3, descr = $4,"
+            " value = $5, archived = $6 WHERE id = $7",
+            name, scope, vtype, descr, value, archived, old["id"],
+        )
+    else:
+        count = await db.fetchrow(
+            "SELECT COUNT(*) AS n FROM variables WHERE project_id = $1", project["id"])
+        if (count or {}).get("n", 0) >= MAX_VARS:
+            raise web.HTTPBadRequest(text=f"Больше {MAX_VARS} переменных не бывает")
+        await db.execute(
+            "INSERT INTO variables (project_id, name, scope, vtype, descr, value,"
+            " archived, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            project["id"], name, scope, vtype, descr, value, archived, time.time(),
+        )
+    return web.json_response(
+        {"ok": True, "vars": [short_var(v) for v in await list_vars(project["id"])]})
+
+
+async def api_var_delete(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    body = await request.json()
+    await db.execute("DELETE FROM variables WHERE project_id = $1 AND name = $2",
+                     project["id"], _name(body.get("name")))
+    return web.json_response(
+        {"ok": True, "vars": [short_var(v) for v in await list_vars(project["id"])]})
+
+
+async def api_tags(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    return web.json_response({"tags": [t["name"] for t in await list_tags(project["id"])]})
+
+
+async def api_tag_save(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    body = await request.json()
+    name = _name(body.get("name"))
+    if not name:
+        raise web.HTTPBadRequest(text="Не указано название тега")
+    was = _name(body.get("was"))
+
+    if was and was != name:
+        await db.execute("UPDATE tags SET name = $1 WHERE project_id = $2 AND name = $3",
+                         name, project["id"], was)
+        await rename_tag_everywhere(project["id"], was, name)
+    else:
+        await ensure_tag(project["id"], name)
+    return web.json_response(
+        {"ok": True, "tags": [t["name"] for t in await list_tags(project["id"])]})
+
+
+async def api_tag_delete(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    body = await request.json()
+    name = _name(body.get("name"))
+    await db.execute("DELETE FROM tags WHERE project_id = $1 AND name = $2",
+                     project["id"], name)
+    await rename_tag_everywhere(project["id"], name, "")
+    return web.json_response(
+        {"ok": True, "tags": [t["name"] for t in await list_tags(project["id"])]})
+
+
+async def rename_tag_everywhere(project_id: int, was: str, now: str) -> None:
+    """Переименовали или убрали тег — правим его и у людей."""
+    if not was:
+        return
+    rows = await db.fetch(
+        "SELECT chat_id, vars FROM sessions WHERE project_id = $1", project_id)
+    for row in rows:
+        try:
+            variables = json.loads(row["vars"])
+        except (TypeError, ValueError):
+            continue
+        tags = variables.get(TAGS_KEY)
+        if not isinstance(tags, list) or was not in tags:
+            continue
+        tags = [now if t == was else t for t in tags if now or t != was]
+        variables[TAGS_KEY] = list(dict.fromkeys(t for t in tags if t))
+        await db.execute(
+            "UPDATE sessions SET vars = $1 WHERE project_id = $2 AND chat_id = $3",
+            json.dumps(variables, ensure_ascii=False), project_id, row["chat_id"],
+        )
+
+
+async def api_users(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    rows = await db.fetch(
+        "SELECT chat_id, vars, subscribed, updated_at FROM sessions"
+        " WHERE project_id = $1 ORDER BY updated_at DESC LIMIT 300", project["id"])
+    people = []
+    for row in rows:
+        try:
+            variables = json.loads(row["vars"])
+        except (TypeError, ValueError):
+            variables = {}
+        if not isinstance(variables, dict):
+            variables = {}
+        tags = variables.get(TAGS_KEY)
+        people.append({
+            "chat_id": row["chat_id"],
+            "name": str(variables.get("name", "")) or "без имени",
+            "username": str(variables.get("username", "")),
+            "tags": [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else [],
+            "subscribed": bool(row["subscribed"]),
+            "last": row["updated_at"],
+        })
+    return web.json_response({"people": people})
+
+
+async def api_user_tags(request: web.Request) -> web.Response:
+    project, _ = await current_project(request)
+    body = await request.json()
+    chat_id = int(body.get("chat_id") or 0)
+    wanted = [_name(t) for t in (body.get("tags") or [])][:20]
+    wanted = list(dict.fromkeys(t for t in wanted if t))
+
+    row = await db.fetchrow(
+        "SELECT vars FROM sessions WHERE project_id = $1 AND chat_id = $2",
+        project["id"], chat_id)
+    if not row:
+        raise web.HTTPBadRequest(text="Такого человека нет")
+    try:
+        variables = json.loads(row["vars"])
+    except (TypeError, ValueError):
+        variables = {}
+    variables[TAGS_KEY] = wanted
+    await db.execute(
+        "UPDATE sessions SET vars = $1 WHERE project_id = $2 AND chat_id = $3",
+        json.dumps(variables, ensure_ascii=False), project["id"], chat_id)
+    for tag in wanted:
+        await ensure_tag(project["id"], tag)
+    return web.json_response({"ok": True})
+
+
+async def api_broadcast(request: web.Request) -> web.Response:
+    """Рассылка: одно сообщение всем, кто от неё не отписался."""
+    project, _ = await current_project(request)
+    if not project["bot_token"]:
+        raise web.HTTPBadRequest(text="Сначала подключите бота")
+    body = await request.json()
+    text = _text(body.get("text"), 3000).strip()
+    if not text:
+        raise web.HTTPBadRequest(text="Напишите текст рассылки")
+    only_tag = _name(body.get("tag"))
+
+    rows = await db.fetch(
+        "SELECT chat_id, vars FROM sessions WHERE project_id = $1 AND subscribed = 1",
+        project["id"])
+    targets = []
+    for row in rows:
+        try:
+            variables = json.loads(row["vars"])
+        except (TypeError, ValueError):
+            variables = {}
+        if not isinstance(variables, dict):
+            variables = {}
+        tags = variables.get(TAGS_KEY) or []
+        if only_tag and (not isinstance(tags, list) or only_tag not in tags):
+            continue
+        targets.append((row["chat_id"], variables))
+
+    asyncio.create_task(deliver(project, text, targets))
+    return web.json_response({"ok": True, "people": len(targets)})
+
+
+async def deliver(project: dict, text: str, targets: List[tuple]) -> None:
+    """Шлём не спеша: Telegram не любит больше тридцати сообщений в секунду."""
+    for chat_id, variables in targets:
+        try:
+            await tg_text(project["bot_token"], "sendMessage", chat_id=chat_id,
+                          text=fill(text, variables)[:4096])
+        except Exception:
+            log.exception("Рассылка: не ушло сообщение в чат %s", chat_id)
+        await asyncio.sleep(0.05)
+    log.info("Рассылка проекта %s: %s человек", project["id"], len(targets))
+
+
+async def take_picture(chat_id: int, message: dict) -> bool:
+    """Присланную боту картинку кладём в галерею этого человека.
+
+    Так картинки для сообщений не приходится нигде выкладывать: скинул боту
+    в переписке — и она сразу видна в конструкторе.
+    """
+    file_id, mime = "", "image/jpeg"
+    sizes = message.get("photo") or []
+    document = message.get("document") or {}
+    if sizes:
+        file_id = (sizes[-1] or {}).get("file_id") or ""
+    elif str(document.get("mime_type") or "").startswith("image/"):
+        file_id = document.get("file_id") or ""
+        mime = document["mime_type"]
+    if not file_id:
+        return False
+
+    blob = await tg_download(BOT_TOKEN, file_id)
+    if not blob:
+        await tg(BOT_TOKEN, "sendMessage", chat_id=chat_id,
+                 text="Не смог забрать картинку. Она слишком большая — до 5 МБ.")
+        return True
+
+    await save_asset(chat_id, blob, mime)
+    row = await db.fetchrow(
+        "SELECT COUNT(*) AS n FROM assets WHERE owner_id = $1", chat_id)
+    await tg(
+        BOT_TOKEN, "sendMessage", chat_id=chat_id,
+        text=(f"Картинка сохранена. Всего в галерее: {(row or {}).get('n', 1)}.\n"
+              "Она уже доступна в блоке «Сообщение» — кнопка «Выбрать картинку»."),
+    )
+    return True
+
+
 async def hook_main(request: web.Request) -> web.Response:
-    """Апдейты самого бота-конструктора: только приветствие с кнопкой."""
+    """Апдейты самого бота-конструктора: приветствие и приём картинок."""
     if not same_secret(request.match_info["secret"], MAIN_SECRET):
         raise web.HTTPForbidden(text="forbidden")
     update = await request.json()
     message = update.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     text = (message.get("text") or "").strip().lower()
+
+    if chat_id and await take_picture(chat_id, message):
+        return web.json_response({"ok": True})
 
     if chat_id and text.startswith(("/start", "/help")):
         await tg(
@@ -1403,10 +2211,22 @@ def build_app() -> web.Application:
     app = web.Application(middlewares=[errors_as_json], client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", page_index)
     app.router.add_get("/health", page_health)
+    app.router.add_get("/img/{token}", page_image)
     app.router.add_get("/api/state", api_state)
     app.router.add_post("/api/scenario", api_save)
     app.router.add_post("/api/bot/connect", api_connect)
     app.router.add_post("/api/bot/disconnect", api_disconnect)
+    app.router.add_get("/api/assets", api_assets)
+    app.router.add_post("/api/assets/delete", api_asset_delete)
+    app.router.add_get("/api/vars", api_vars)
+    app.router.add_post("/api/vars/save", api_var_save)
+    app.router.add_post("/api/vars/delete", api_var_delete)
+    app.router.add_get("/api/tags", api_tags)
+    app.router.add_post("/api/tags/save", api_tag_save)
+    app.router.add_post("/api/tags/delete", api_tag_delete)
+    app.router.add_get("/api/users", api_users)
+    app.router.add_post("/api/users/tags", api_user_tags)
+    app.router.add_post("/api/broadcast", api_broadcast)
     app.router.add_post("/hook/main/{secret}", hook_main)
     app.router.add_post("/hook/{project_id}/{secret}", hook_client)
     app.on_startup.append(on_startup)
@@ -1579,6 +2399,7 @@ button{cursor:pointer}
 textarea.inp{min-height:78px;resize:vertical}
 .row{display:flex;gap:6px;align-items:center}
 .row>.inp{min-width:0}
+.row>.combo{flex:1;min-width:0}
 .mini{flex:none;width:34px;height:34px;border:none;border-radius:9px;background:#f0f3f7;
       color:var(--soft);font-size:14px}
 .mini.kill{color:var(--danger)}
@@ -1610,8 +2431,58 @@ textarea.inp{min-height:78px;resize:vertical}
              background:transparent;text-align:left;font-size:14px}
 .menu button.kill{color:var(--danger)}
 .menu hr{margin:5px 8px;border:none;border-top:1px solid var(--line)}
+.sheet.big{width:min(620px,94vw);max-height:86vh}
+
+/* ---------- галерея картинок ---------- */
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;
+         margin-top:10px}
+.shot{position:relative;padding:0;border:1px solid var(--line);border-radius:11px;
+      background:#f2f5f8;overflow:hidden;aspect-ratio:1/1}
+.shot img{width:100%;height:100%;object-fit:cover;display:block}
+.shot.on{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.shot .drop{position:absolute;right:3px;top:3px;width:22px;height:22px;border:none;
+            border-radius:50%;background:rgba(20,32,45,.6);color:#fff;font-size:11px;
+            line-height:1}
+.preview{margin-top:8px;border:1px solid var(--line);border-radius:11px;overflow:hidden;
+         background:#f2f5f8}
+.preview img{display:block;width:100%;max-height:190px;object-fit:contain}
+
+/* ---------- выпадающий выбор с поиском ---------- */
+.combo{position:relative}
+.combo-list{position:absolute;left:0;right:0;top:100%;z-index:9;max-height:200px;
+            overflow-y:auto;margin-top:3px;border-radius:11px;background:var(--sheet);
+            box-shadow:0 8px 26px rgba(21,40,60,.22)}
+.combo-list button{display:flex;align-items:center;gap:7px;width:100%;padding:9px 11px;
+                   border:none;background:transparent;text-align:left;font-size:13px}
+.combo-list button:hover{background:#f2f5f8}
+.combo-list .kind{margin-left:auto;font-size:11px;color:var(--soft)}
+.combo-list .empty{padding:10px 11px;font-size:12px;color:var(--soft)}
+.pin{flex:none;width:9px;height:9px;border-radius:50%;background:#3390ec}
+.pin.project{background:#8b5cf6}
+.pin.tag{background:#9aa8b6}
+
+/* ---------- списки на страницах ---------- */
+.tabs{display:flex;gap:6px;margin:10px 0 4px}
+.tabs button{padding:7px 12px;border:none;border-radius:10px;background:#f0f3f7;
+             font-size:13px}
+.tabs button.on{background:var(--accent);color:#fff;font-weight:600}
+.rows{margin-top:6px}
+.rw{display:flex;align-items:center;gap:8px;padding:9px 4px;border-bottom:1px solid var(--line)}
+.rw .grow{min-width:0}
+.rw b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw small{display:block;font-size:11px;color:var(--soft)}
+.rw .mini{width:30px;height:30px}
+.pill{display:inline-block;padding:2px 9px;border-radius:10px;background:#e8f0fb;
+      color:#12608e;font-size:11px;margin:2px 4px 2px 0}
+.pill.project{background:#efe6fd;color:#6a2ea0}
+.pill.tag{background:#eceff3;color:#41556b}
+.empty{padding:18px 4px;text-align:center;font-size:13px;color:var(--soft)}
 
 @media (max-width:700px){
+  /* Кнопок наверху много, а места мало — ужимаем их и подпись бота. */
+  .chip{max-width:34%;padding:7px 9px}
+  .round{width:34px;height:34px;font-size:14px}
+  .save{padding:0 10px;height:34px}
   .panel{left:0;right:0;top:auto;bottom:0;width:auto;max-height:66vh;
          border-radius:16px 16px 0 0;box-shadow:0 -3px 18px rgba(21,40,60,.22);
          padding-bottom:calc(16px + env(safe-area-inset-bottom))}
@@ -1633,6 +2504,9 @@ textarea.inp{min-height:78px;resize:vertical}
   <div class="topbar">
     <button class="chip" id="chip"><span>🤖</span><span class="who" id="chipWho"></span></button>
     <span class="grow"></span>
+    <button class="round" id="peopleBtn" title="Люди">👥</button>
+    <button class="round" id="tagsBtn" title="Теги">🏷</button>
+    <button class="round" id="varsBtn" title="Переменные">{ }</button>
     <button class="save" id="save">Сохранить</button>
     <button class="round" id="menuBtn">☰</button>
   </div>
@@ -1701,6 +2575,83 @@ function pick(options, value, onchange) {
   return node;
 }
 
+/* Поле с подсказкой: пока печатаешь, снизу висит список подходящего.
+   Можно выбрать готовое, а можно написать своё — тогда оно заведётся само. */
+function combo(value, placeholder, items, onpick) {
+  var box = el("div", {class: "combo"});
+  var list = null;
+  var field = el("input", {class: "inp", value: value || "",
+                           placeholder: placeholder || ""});
+
+  function close() {
+    if (list) { list.remove(); list = null; }
+  }
+
+  function open() {
+    close();
+    var wanted = field.value.trim().toLowerCase();
+    var shown = items().filter(function (item) {
+      return !wanted || item.name.toLowerCase().indexOf(wanted) >= 0;
+    }).slice(0, 40);
+    list = el("div", {class: "combo-list"});
+    if (!shown.length) {
+      list.append(el("div", {class: "empty"}, "Пока такого нет — напишите своё."));
+    }
+    shown.forEach(function (item) {
+      list.append(el("button", {onpointerdown: function (e) {
+        e.preventDefault();               /* иначе поле потеряет фокус раньше */
+        field.value = item.name;
+        close();
+        onpick(item.name);
+      }},
+        el("span", {class: "pin " + (item.tone || "")}),
+        el("span", {}, item.name),
+        item.kind ? el("span", {class: "kind"}, item.kind) : null));
+    });
+    box.append(list);
+  }
+
+  field.addEventListener("focus", open);
+  field.addEventListener("input", function () {
+    field.value = cleanChars(field.value);
+    open();
+    onpick(field.value);
+  });
+  field.addEventListener("blur", function () {
+    field.value = cleanName(field.value);       /* набрали — привели в порядок */
+    onpick(field.value);
+    setTimeout(close, 150);
+  });
+  box.append(field);
+  return box;
+}
+
+/* Что показывать в подсказках. */
+function varItems() {
+  return VARS.filter(function (v) { return !v.archived; }).map(function (v) {
+    return {name: v.name, kind: v.vtype === "number" ? "число" : "текст",
+            tone: v.scope === "project" ? "project" : ""};
+  });
+}
+function tagItems() {
+  return TAGS.map(function (name) { return {name: name, kind: "", tone: "tag"}; });
+}
+
+/* Кнопка «{ }» рядом с текстом: вставляет переменную прямо туда, где курсор. */
+function insertVarButton(field, onchange) {
+  return el("button", {class: "mini", title: "Вставить переменную",
+                       onclick: function () {
+    chooseFrom("Вставить переменную", varItems, function (name) {
+      var text = field.value || "";
+      var from = field.selectionStart, to = field.selectionEnd;
+      if (typeof from !== "number") { from = to = text.length; }
+      field.value = text.slice(0, from) + "{" + name + "}" + text.slice(to);
+      onchange(field.value);
+      try { field.focus(); } catch (e) {}
+    });
+  }}, "{ }");
+}
+
 /* Кнопка, которую надо нажать дважды: системные диалоги в мини-аппах
    открываются не везде, поэтому подтверждаем так. */
 function armed(button, warning, action) {
@@ -1756,17 +2707,27 @@ var EVENT_NAMES = [
   ["any", "написал что угодно"],
 ];
 var ACTION_NAMES = [
-  ["set_var", "записать переменную"],
-  ["del_var", "удалить переменную"],
-  ["add_tag", "поставить тег"],
-  ["del_tag", "снять тег"],
-  ["notify", "прислать мне заявку"],
+  ["set_var", "Изменить переменную"],
+  ["add_tag", "Добавить тег"],
+  ["del_tag", "Удалить тег"],
+  ["notify", "Отправить уведомление"],
+  ["subscribe", "Подписать на рассылку"],
+  ["unsubscribe", "Отписать от рассылки"],
 ];
+var ACTION_GLYPHS = {set_var: "✎", add_tag: "🏷", del_tag: "🚫",
+                     notify: "🔔", subscribe: "👤", unsubscribe: "👤"};
 var OP_NAMES = [
   ["eq", "равна"], ["ne", "не равна"], ["has", "содержит"],
   ["empty", "пустая"], ["tag", "есть тег"],
+  ["gt", "больше"], ["lt", "меньше"],
+  ["gte", "больше или равна"], ["lte", "меньше или равна"],
 ];
+/* Знак у действия «Изменить переменную». У текстовой переменной есть только
+   «=»: складывать и умножать буквы не получится. */
+var SET_OPS = [["set", "="], ["add", "+"], ["sub", "−"], ["mul", "×"], ["div", "÷"]];
 var UNIT_NAMES = [["minute", "минут"], ["hour", "часов"], ["day", "дней"]];
+var TYPE_NAMES = [["text", "Текст"], ["number", "Число"]];
+var SCOPE_NAMES = [["user", "Пользовательская"], ["project", "Проектная"]];
 
 function labelOf(list, value) {
   for (var i = 0; i < list.length; i++) if (list[i][0] === value) return list[i][1];
@@ -1775,7 +2736,28 @@ function labelOf(list, value) {
 
 /* ---- состояние ---- */
 var S = {start: "", steps: []};
+var VARS = [];            /* общий список переменных проекта */
+var TAGS = [];            /* общий список тегов */
+var SHOTS = null;         /* галерея картинок, подгружается по требованию */
 var BOT = {connected: false, bot_username: "", people: 0};
+
+function varByName(name) {
+  for (var i = 0; i < VARS.length; i++) if (VARS[i].name === name) return VARS[i];
+  return null;
+}
+function isNumberVar(name) {
+  var found = varByName(name);
+  return !!found && found.vtype === "number";
+}
+/* Пока человек печатает, убираем только запрещённые знаки: если резать
+   пробелы сразу, название из двух слов набрать не получится. */
+function cleanChars(text) {
+  return String(text || "").replace(/[^0-9A-Za-zА-Яа-яЁё_ ]/g, "").slice(0, 40);
+}
+/* А это — окончательный вид названия, к нему приводим, когда набор закончен. */
+function cleanName(text) {
+  return cleanChars(text).replace(/\s+/g, " ").trim();
+}
 var SEL = "";             /* какой блок выбран */
 var LINKING = null;       /* {id, out} — от какого кружка тянем стрелку */
 var PAN = {x: 40, y: 90, z: 1, ready: false};
@@ -1842,13 +2824,16 @@ function setLink(step, outIndex, targetId) {
 
 function blankStep(type) {
   var step = {id: nextId(), type: type, name: "", next: "", x: 0, y: 0};
-  if (type === "message") { step.text = ""; step.photo = ""; step.file = ""; step.buttons = []; }
-  if (type === "input") { step.text = ""; step.save_to = ""; }
+  if (type === "message") {
+    step.text = ""; step.photo = ""; step.file = ""; step.inline = false; step.buttons = [];
+  }
+  if (type === "input") { step.text = ""; step.save_to = ""; step.expect = "any"; step.retry = ""; }
   if (type === "keywords") { step.match = "contains"; step.words = ""; }
   if (type === "event") { step.event = "first"; }
   if (type === "action") { step.actions = []; }
   if (type === "condition") { step.checks = []; step.otherwise = ""; }
   if (type === "random") {
+    step.always = false;
     step.options = [{label: "A", weight: 50, next: ""},
                     {label: "B", weight: 50, next: ""}];
     delete step.next;
@@ -1987,13 +2972,15 @@ function nodeBody(step) {
     var text = shorten(step.text, 90);
     box.append(el("div", {class: "node-fill" + (text ? " filled" : "")},
       text || (t === "input" ? "Задайте вопрос…" : "Добавьте текст…")));
-    if (t === "message" && (step.photo || step.file)) {
+    if (t === "message" && (step.photo || step.file || step.inline)) {
       box.append(el("div", {class: "node-line dim", style: "margin-top:6px"},
-        (step.photo ? "🖼 картинка " : "") + (step.file ? "📎 файл" : "")));
+        (step.photo ? "🖼 картинка " : "") + (step.file ? "📎 файл " : "") +
+        (step.inline ? "кнопки в сообщении" : "")));
     }
     if (t === "input" && step.save_to) {
       box.append(el("div", {class: "node-line dim", style: "margin-top:6px"},
-        "ответ → {" + step.save_to + "}"));
+        (step.expect === "number" ? "только число → {" : "ответ → {") +
+        step.save_to + "}"));
     }
   } else if (t === "keywords") {
     box.append(el("div", {class: "node-cap"},
@@ -2009,8 +2996,18 @@ function nodeBody(step) {
       box.append(el("div", {class: "node-fill"}, "Нажмите, чтобы добавить действие"));
     } else {
       list.forEach(function (action) {
-        box.append(el("div", {class: "node-line"}, "• " + labelOf(ACTION_NAMES, action.kind) +
-          (action.name ? " " + action.name : "")));
+        box.append(el("div", {class: "node-cap"}, labelOf(ACTION_NAMES, action.kind)));
+        var tail = action.name || "—";
+        if (action.kind === "set_var") {
+          tail = (action.name || "переменная не указана") + " " +
+                 labelOf(SET_OPS, action.op || "set") + " " +
+                 (shorten(action.value, 18) || "пусто");
+        } else if (action.kind === "notify") {
+          tail = shorten(action.value, 28) || "все ответы";
+        } else if (action.kind === "subscribe" || action.kind === "unsubscribe") {
+          tail = action.kind === "subscribe" ? "подписать" : "отписать";
+        }
+        box.append(el("div", {class: "node-line"}, tail));
       });
     }
   } else if (t === "condition") {
@@ -2019,8 +3016,9 @@ function nodeBody(step) {
       box.append(el("div", {class: "node-fill"}, "Задайте условие…"));
     } else {
       checks.forEach(function (check) {
+        var left = check.op === "tag" ? "тег" : "{" + (check.var || "?") + "}";
         box.append(el("div", {class: "node-line"},
-          "{" + (check.var || "?") + "} " + labelOf(OP_NAMES, check.op) +
+          left + " " + labelOf(OP_NAMES, check.op) +
           (check.op === "empty" ? "" : " " + shorten(check.value, 20))));
       });
     }
@@ -2208,10 +3206,26 @@ function renderCanvas() {
   }
 }
 
-/* Полотно: одним пальцем двигаем, двумя — приближаем. */
+/* Полотно: одним пальцем двигаем, двумя — приближаем.
+   Два быстрых касания (или правая кнопка мыши) по пустому месту — палитра. */
 function attachCanvas() {
   var canvas = document.getElementById("canvas");
-  var points = {}, pan = null, pinch = null;
+  var points = {}, pan = null, pinch = null, tap = null;
+
+  function worldAt(e) {
+    var box = canvas.getBoundingClientRect();
+    return {x: (e.clientX - box.left - PAN.x) / PAN.z,
+            y: (e.clientY - box.top - PAN.y) / PAN.z};
+  }
+
+  function onNode(e) {
+    return !!(e.target && e.target.closest && e.target.closest(".node"));
+  }
+
+  canvas.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+    if (!onNode(e)) openPalette(worldAt(e));
+  });
 
   function ids() { return Object.keys(points); }
   function gap(a, b) {
@@ -2260,8 +3274,17 @@ function attachCanvas() {
   function release(e) {
     delete points[e.pointerId];
     if (ids().length < 2) pinch = null;
-    if (pan && !pan.moved) {          /* тап мимо блоков — снимаем выделение */
-      if (LINKING || SEL) deselect();
+    if (pan && !pan.moved && !onNode(e)) {
+      var now = new Date().getTime();
+      var again = tap && now - tap.at < 340 &&
+                  Math.abs(e.clientX - tap.x) < 26 && Math.abs(e.clientY - tap.y) < 26;
+      if (again) {                    /* два касания подряд — добавляем блок */
+        tap = null;
+        openPalette(worldAt(e));
+      } else {                        /* одиночный тап мимо блоков — снять выбор */
+        tap = {at: now, x: e.clientX, y: e.clientY};
+        if (LINKING || SEL) deselect();
+      }
     }
     if (!ids().length) pan = null;
   }
@@ -2371,20 +3394,100 @@ function renderPanel() {
                     "Точно удалить?", function () { removeStep(step.id); }));
 }
 
+/* Строка «текстовое поле + кнопка вставки переменной». */
+function textWithVars(value, placeholder, onchange) {
+  var field = area(value, placeholder, function (e) { onchange(e.target.value); });
+  var box = el("div", {});
+  box.append(field);
+  box.append(el("div", {class: "row", style: "margin-top:6px"},
+    insertVarButton(field, onchange),
+    el("div", {class: "note", style: "margin:0;flex:1"},
+      "Кнопка { } вставит переменную. Оформление: <b>жирный</b>, <i>курсив</i>, <code>код</code>.")));
+  return box;
+}
+
+function shotSrc(value) {
+  var text = String(value || "");
+  return text.indexOf("asset:") === 0 ? "/img/" + text.slice(6) : text;
+}
+
+/* Картинка выбирается из галереи — того, что человек прислал боту в личку.
+   Ссылку руками вводить больше не нужно. */
+function photoField(step) {
+  var box = el("div", {});
+  if (step.photo) {
+    box.append(el("div", {class: "preview"}, el("img", {src: shotSrc(step.photo)})));
+  }
+  var row = el("div", {class: "row", style: "margin-top:8px"});
+  row.append(el("button", {class: "wide ghost", style: "margin:0", onclick: function () {
+    openGallery(step);
+  }}, step.photo ? "Выбрать другую" : "Выбрать картинку"));
+  if (step.photo) {
+    row.append(el("button", {class: "mini kill", onclick: function () {
+      step.photo = "";
+      touch(); renderCanvas(); renderPanel();
+    }}, "✕"));
+  }
+  box.append(row);
+  box.append(el("div", {class: "note"},
+    "Пришлите картинку боту-конструктору в переписке — и она появится здесь."));
+  return box;
+}
+
+async function openGallery(step) {
+  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  var grid = el("div", {class: "gallery"});
+  sheet.append(el("h3", {}, "Ваши картинки"), grid,
+    el("div", {class: "note"},
+      "Новая появится здесь сразу, как пришлёте её боту-конструктору в личные сообщения."));
+  popup(sheet);
+
+  if (!SHOTS) {
+    grid.append(el("div", {class: "empty"}, "Загружаю…"));
+    try {
+      SHOTS = (await api("/api/assets")).assets || [];
+    } catch (e) {
+      SHOTS = [];
+      flash(e.message, "long");
+    }
+  }
+  grid.textContent = "";
+  if (!SHOTS.length) {
+    grid.append(el("div", {class: "empty", style: "grid-column:1/-1"},
+      "Пока пусто. Пришлите боту картинку в переписке."));
+  }
+  SHOTS.forEach(function (shot) {
+    var mark = "asset:" + shot.token;
+    var tile = el("button", {class: "shot" + (step.photo === mark ? " on" : ""),
+                             onclick: function () {
+      step.photo = mark;
+      closePopups();
+      touch(); renderCanvas(); renderPanel();
+    }}, el("img", {src: "/img/" + shot.token, loading: "lazy", alt: ""}));
+    tile.append(armed(el("button", {class: "drop"}, "✕"), "✓", async function () {
+      try {
+        await api("/api/assets/delete",
+                  {method: "POST", body: JSON.stringify({token: shot.token})});
+      } catch (e) { flash(e.message, "long"); return; }
+      SHOTS = SHOTS.filter(function (s) { return s.token !== shot.token; });
+      if (step.photo === mark) { step.photo = ""; touch(); renderCanvas(); }
+      closePopups();
+      openGallery(step);
+    }));
+    grid.append(tile);
+  });
+}
+
 function fieldsMessage(body, step) {
   body.append(cap("Текст сообщения"));
-  body.append(area(step.text, "Что напишет бот", function (e) {
-    step.text = e.target.value;
+  body.append(textWithVars(step.text, "Что напишет бот", function (value) {
+    step.text = value;
     refresh(step);
   }));
-  body.append(el("div", {class: "note"},
-    "Значения ответов вставляются так: {имя}. Всегда есть {name} и {username}."));
 
-  body.append(cap("Картинка — ссылка"));
-  body.append(line(step.photo, "https://…", function (e) {
-    step.photo = e.target.value;
-    refresh(step);
-  }));
+  body.append(cap("Картинка"));
+  body.append(photoField(step));
+
   body.append(cap("Файл — ссылка"));
   body.append(line(step.file, "https://…", function (e) {
     step.file = e.target.value;
@@ -2392,6 +3495,14 @@ function fieldsMessage(body, step) {
   }));
 
   body.append(cap("Кнопки"));
+  var inline = el("input", {type: "checkbox", onchange: function (e) {
+    step.inline = e.target.checked;
+    touch(); renderCanvas(); renderPanel();
+  }});
+  inline.checked = !!step.inline;
+  body.append(el("label", {class: "check", style: "margin-top:0"}, inline,
+    el("span", {}, "Кнопки внутри сообщения, а не под полем ввода")));
+
   var buttons = step.buttons || (step.buttons = []);
   buttons.forEach(function (button, index) {
     var group = el("div", {class: "group"});
@@ -2428,24 +3539,44 @@ function fieldsMessage(body, step) {
       touch(); renderCanvas(); renderPanel();
     }}, "+ Добавить кнопку"));
   }
-  body.append(el("div", {class: "note"},
-    "Кнопки появляются под полем ввода. Такая кнопка не умеет быть ссылкой — " +
-    "поэтому «присылает ссылку» отправляет её отдельным сообщением. " +
-    "Цвет кнопок Telegram не поддерживает."));
+  body.append(el("div", {class: "note"}, step.inline
+    ? "Кнопки внутри сообщения: такая кнопка умеет быть настоящей ссылкой. " +
+      "Цвет кнопок Telegram не поддерживает."
+    : "Кнопки под полем ввода. Такая кнопка не умеет быть ссылкой — поэтому " +
+      "«присылает ссылку» отправляет её отдельным сообщением. Поставьте галочку " +
+      "выше, чтобы ссылка открывалась прямо из кнопки."));
 }
 
 function fieldsInput(body, step) {
   body.append(cap("Вопрос"));
-  body.append(area(step.text, "Например: как вас зовут?", function (e) {
-    step.text = e.target.value;
+  body.append(textWithVars(step.text, "Например: как вас зовут?", function (value) {
+    step.text = value;
     refresh(step);
   }));
-  body.append(cap("Запомнить ответ под именем"));
-  body.append(line(step.save_to, "имя", function (e) {
-    step.save_to = e.target.value.replace(/[^0-9A-Za-zА-Яа-яЁё_]/g, "");
-    e.target.value = step.save_to;
+
+  body.append(cap("Запомнить ответ в переменную"));
+  body.append(combo(step.save_to, "имя", varItems, function (name) {
+    step.save_to = name;
     refresh(step);
   }));
+
+  body.append(cap("Что человек должен ответить"));
+  body.append(pick([["any", "что угодно"], ["number", "только число"]],
+    step.expect || "any", function (e) {
+      step.expect = e.target.value;
+      touch(); renderCanvas(); renderPanel();
+    }));
+
+  if (step.expect === "number") {
+    body.append(cap("Если ответ не число"));
+    body.append(line(step.retry, "Нужно число. Напишите цифрами.", function (e) {
+      step.retry = e.target.value;
+      refresh(step);
+    }));
+    body.append(el("div", {class: "note"},
+      "Бот не пойдёт дальше, пока не получит число."));
+  }
+
   body.append(el("div", {class: "note"},
     "Дальше подставляйте в текст как {" + (step.save_to || "имя") + "}."));
 }
@@ -2481,6 +3612,9 @@ function fieldsAction(body, step) {
     group.append(el("div", {class: "row"},
       pick(ACTION_NAMES, action.kind, function (e) {
         action.kind = e.target.value;
+        action.name = "";
+        action.value = "";
+        action.op = "set";
         touch(); renderCanvas(); renderPanel();
       }),
       el("button", {class: "mini kill", onclick: function () {
@@ -2488,40 +3622,86 @@ function fieldsAction(body, step) {
         touch(); renderCanvas(); renderPanel();
       }}, "✕")));
 
-    if (action.kind === "set_var" || action.kind === "del_var") {
-      group.append(el("div", {class: "row", style: "margin-top:6px"},
-        line(action.name, "имя переменной", function (e) {
-          action.name = e.target.value.replace(/[^0-9A-Za-zА-Яа-яЁё_]/g, "");
-          e.target.value = action.name;
-          refresh(step);
-        })));
-    }
     if (action.kind === "set_var") {
+      /* Знаки «+ − × ÷» имеют смысл только у числовой переменной. Панель при
+         этом не перерисовываем — иначе поле теряло бы курсор во время набора,
+         поэтому просто включаем и выключаем нужное. */
+      var value = line(action.value, "значение", function (e) {
+        action.value = e.target.value;
+        refresh(step);
+      });
+      var signs = pick(SET_OPS, action.op || "set", function (e) {
+        action.op = e.target.value;
+        refresh(step);
+      });
+      signs.style.flex = "none";
+      signs.style.width = "62px";
+      var hint = el("div", {class: "note"},
+        "Переменная текстовая: её можно только записать. Чтобы складывать и " +
+        "умножать, сделайте её числовой на странице «Переменные».");
+
+      function syncSigns() {
+        var numeric = isNumberVar(action.name);
+        signs.disabled = !numeric;
+        if (!numeric) {
+          action.op = "set";
+          signs.value = "set";
+        }
+        value.placeholder = numeric ? "число или {переменная} + 1"
+                                    : "значение, можно с {переменными}";
+        hint.hidden = numeric || !action.name;
+      }
+
       group.append(el("div", {style: "margin-top:6px"},
-        line(action.value, "значение, можно с {переменными}", function (e) {
-          action.value = e.target.value;
+        combo(action.name, "переменная", varItems, function (name) {
+          action.name = name;
+          syncSigns();
           refresh(step);
         })));
+      group.append(el("div", {class: "row", style: "margin-top:6px"}, signs, value,
+        insertVarButton(value, function (text) {
+          action.value = text;
+          value.value = text;
+          refresh(step);
+        })));
+      group.append(hint);
+      syncSigns();
     }
+
     if (action.kind === "add_tag" || action.kind === "del_tag") {
       group.append(el("div", {style: "margin-top:6px"},
-        line(action.name, "название тега", function (e) {
-          action.name = e.target.value.replace(/[^0-9A-Za-zА-Яа-яЁё_]/g, "");
-          e.target.value = action.name;
+        combo(action.name, "название тега", tagItems, function (name) {
+          action.name = name;
           refresh(step);
         })));
     }
+
     if (action.kind === "notify") {
-      group.append(el("div", {style: "margin-top:6px"},
-        line(action.value, "текст письма, пусто — все ответы", function (e) {
+      var note = line(action.value, "текст уведомления, пусто — все ответы",
+        function (e) {
           action.value = e.target.value;
           refresh(step);
+        });
+      group.append(el("div", {class: "row", style: "margin-top:6px"}, note,
+        insertVarButton(note, function (text) {
+          action.value = text;
+          note.value = text;
+          refresh(step);
         })));
+      group.append(el("div", {class: "note"},
+        "Придёт вам в переписку с ботом-конструктором."));
     }
+
+    if (action.kind === "subscribe" || action.kind === "unsubscribe") {
+      group.append(el("div", {class: "note"}, action.kind === "subscribe"
+        ? "Человек снова начнёт получать рассылки."
+        : "Человек перестанет получать рассылки, но бот будет отвечать как обычно."));
+    }
+
     body.append(group);
   });
   body.append(el("button", {class: "add", onclick: function () {
-    actions.push({kind: "set_var", name: "", value: ""});
+    actions.push({kind: "set_var", name: "", op: "set", value: ""});
     touch(); renderCanvas(); renderPanel();
   }}, "+ Добавить действие"));
 }
@@ -2531,12 +3711,14 @@ function fieldsCondition(body, step) {
   var checks = step.checks || (step.checks = []);
   checks.forEach(function (check, index) {
     var group = el("div", {class: "group"});
+    var tagCheck = check.op === "tag";
     group.append(el("div", {class: "row"},
-      line(check.var, "переменная", function (e) {
-        check.var = e.target.value.replace(/[^0-9A-Za-zА-Яа-яЁё_]/g, "");
-        e.target.value = check.var;
-        refresh(step);
-      }),
+      tagCheck
+        ? el("div", {class: "inp", style: "background:#eef2f6;color:#7c8b9a"}, "у человека")
+        : combo(check.var, "переменная", varItems, function (name) {
+            check.var = name;
+            refresh(step);
+          }),
       el("button", {class: "mini kill", onclick: function () {
         checks.splice(index, 1);
         touch(); renderCanvas(); renderPanel();
@@ -2547,10 +3729,18 @@ function fieldsCondition(body, step) {
         touch(); renderCanvas(); renderPanel();
       }),
       check.op === "empty" ? null
-        : line(check.value, check.op === "tag" ? "тег" : "значение", function (e) {
-            check.value = e.target.value;
-            refresh(step);
-          })));
+        : tagCheck
+          ? combo(check.value, "тег", tagItems, function (name) {
+              check.value = name;
+              refresh(step);
+            })
+          : line(check.value, "значение", function (e) {
+              check.value = e.target.value;
+              refresh(step);
+            })));
+    if (check.op === "gt" || check.op === "lt" || check.op === "gte" || check.op === "lte") {
+      group.append(el("div", {class: "note"}, "Сравниваются числа."));
+    }
     body.append(group);
   });
   body.append(el("button", {class: "add", onclick: function () {
@@ -2606,12 +3796,24 @@ function fieldsRandom(body, step) {
       })));
     body.append(group);
   });
-  body.append(el("button", {class: "add", onclick: function () {
-    options.push({label: String.fromCharCode(65 + options.length), weight: 50, next: ""});
-    touch(); renderCanvas(); renderPanel();
-  }}, "+ Добавить вариант"));
+  if (options.length < 6) {
+    body.append(el("button", {class: "add", onclick: function () {
+      options.push({label: String.fromCharCode(65 + options.length), weight: 50, next: ""});
+      touch(); renderCanvas(); renderPanel();
+    }}, "+ Добавить вариант"));
+  }
+
+  var always = el("input", {type: "checkbox", onchange: function (e) {
+    step.always = e.target.checked;
+    touch(); renderCanvas();
+  }});
+  always.checked = !!step.always;
+  body.append(el("label", {class: "check"}, always,
+    el("span", {}, "Выбирать заново каждый раз")));
   body.append(el("div", {class: "note"},
-    "Проценты — это веса. Их сумма может быть любой."));
+    "Проценты — это веса, их сумма может быть любой. Обычно выпавший вариант " +
+    "закрепляется за человеком: раз выпало «A» — так и будет дальше. Галочка " +
+    "выше это отключает."));
 }
 
 function fieldsTimer(body, step) {
@@ -2680,17 +3882,39 @@ function popup(node) {
   stage.append(shade, node);
 }
 
-function openPalette() {
+function openPalette(at) {
   var sheet = el("div", {class: "sheet", id: "sheet"});
   sheet.append(el("h3", {}, "Добавить блок"));
   var tiles = el("div", {class: "tiles"});
   ORDER.forEach(function (type) {
     tiles.append(el("button", {class: "tile", onclick: function () {
       closePopups();
-      addStep(type);
+      addStep(type, at);
     }}, el("span", {class: "glyph"}, META[type].glyph), META[type].title));
   });
   sheet.append(tiles);
+  popup(sheet);
+}
+
+/* Небольшое окно со списком: выбрать переменную, тег, картинку. */
+function chooseFrom(title, itemsFn, onpick) {
+  var sheet = el("div", {class: "sheet", id: "sheet"});
+  sheet.append(el("h3", {}, title));
+  var items = itemsFn();
+  if (!items.length) {
+    sheet.append(el("div", {class: "empty"}, "Пока пусто."));
+  }
+  var rows = el("div", {class: "combo-list", style: "position:static;box-shadow:none;max-height:56vh"});
+  items.forEach(function (item) {
+    rows.append(el("button", {onclick: function () {
+      closePopups();
+      onpick(item.name);
+    }},
+      el("span", {class: "pin " + (item.tone || "")}),
+      el("span", {}, item.name),
+      item.kind ? el("span", {class: "kind"}, item.kind) : null));
+  });
+  sheet.append(rows);
   popup(sheet);
 }
 
@@ -2699,6 +3923,11 @@ function openMenu() {
   menu.append(el("button", {onclick: function () { closePopups(); save(); }}, "Сохранить"));
   menu.append(el("button", {onclick: function () { closePopups(); autoLayout(); touch(); renderCanvas(); fitView(); }},
     "Разложить блоки"));
+  menu.append(el("hr"));
+  menu.append(el("button", {onclick: function () { closePopups(); openVars(); }},
+    "Переменные"));
+  menu.append(el("button", {onclick: function () { closePopups(); openTags(); }}, "Теги"));
+  menu.append(el("button", {onclick: function () { closePopups(); openPeople(); }}, "Люди"));
   menu.append(el("hr"));
   menu.append(el("button", {onclick: function () { closePopups(); openBotSheet(); }},
     BOT.connected ? "Настройки бота" : "Подключить бота"));
@@ -2731,11 +3960,328 @@ function openBotSheet() {
   popup(sheet);
 }
 
-function addStep(type) {
+/* ======================= переменные, теги, люди ======================= */
+
+function when(seconds) {
+  var d = new Date(seconds * 1000);
+  var two = function (n) { return (n < 10 ? "0" : "") + n; };
+  return two(d.getDate()) + "." + two(d.getMonth() + 1) + "." + d.getFullYear() +
+         " в " + two(d.getHours()) + ":" + two(d.getMinutes());
+}
+
+var VIEW = {scope: "user"};
+
+function openVars() {
+  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  sheet.append(el("h3", {}, "Переменные"));
+  sheet.append(el("div", {class: "note"},
+    "Пользовательская — своё значение у каждого человека. " +
+    "Проектная — одно на всех. Числовая переменная умеет складываться и " +
+    "умножаться, текстовая хранит что угодно."));
+
+  var mine = VARS.filter(function (v) { return v.scope === "user"; });
+  var shared = VARS.filter(function (v) { return v.scope === "project"; });
+  var tabs = el("div", {class: "tabs"});
+  [["user", "Пользовательские", mine.length], ["project", "Проектные", shared.length]]
+    .forEach(function (pair) {
+      tabs.append(el("button", {class: VIEW.scope === pair[0] ? "on" : "",
+                                onclick: function () {
+        VIEW.scope = pair[0];
+        openVars();
+      }}, pair[1] + " " + pair[2]));
+    });
+  sheet.append(tabs);
+
+  var shown = (VIEW.scope === "user" ? mine : shared);
+  var live = shown.filter(function (v) { return !v.archived; });
+  var old = shown.filter(function (v) { return v.archived; });
+
+  var rows = el("div", {class: "rows"});
+  if (!live.length) rows.append(el("div", {class: "empty"}, "Пока ни одной."));
+  live.forEach(function (item) { rows.append(varRow(item)); });
+  sheet.append(rows);
+
+  if (old.length) {
+    sheet.append(cap("Архивированные"));
+    var older = el("div", {class: "rows"});
+    old.forEach(function (item) { older.append(varRow(item)); });
+    sheet.append(older);
+  }
+
+  sheet.append(el("button", {class: "wide", onclick: function () {
+    openVarForm(null);
+  }}, "+ Создать переменную"));
+  popup(sheet);
+}
+
+function varRow(item) {
+  var about = (item.vtype === "number" ? "число" : "текст") +
+              (item.descr ? " · " + item.descr : "");
+  var row = el("div", {class: "rw"},
+    el("div", {class: "grow"},
+      el("b", {}, item.name),
+      el("small", {}, about)),
+    item.scope === "project" && item.value
+      ? el("span", {class: "pill project"}, shorten(item.value, 18)) : null,
+    el("button", {class: "mini", onclick: function () { openVarForm(item); }}, "✎"));
+  return row;
+}
+
+function openVarForm(item) {
+  var draft = item
+    ? {was: item.name, name: item.name, scope: item.scope, vtype: item.vtype,
+       descr: item.descr, value: item.value, archived: item.archived}
+    : {was: "", name: "", scope: VIEW.scope, vtype: "text", descr: "", value: "",
+       archived: false};
+
+  function draw() {
+    var sheet = el("div", {class: "sheet", id: "sheet"});
+    sheet.append(el("h3", {}, item ? "Изменение переменной" : "Создание переменной"));
+
+    sheet.append(cap("Вид"));
+    var kinds = el("div", {class: "tabs"});
+    SCOPE_NAMES.forEach(function (pair) {
+      kinds.append(el("button", {class: draft.scope === pair[0] ? "on" : "",
+                                 onclick: function () {
+        draft.scope = pair[0];
+        draw();
+      }}, pair[1]));
+    });
+    sheet.append(kinds);
+
+    sheet.append(cap("Название переменной"));
+    sheet.append(line(draft.name, "Например: сумма заказа", function (e) {
+      e.target.value = cleanChars(e.target.value);
+      draft.name = cleanName(e.target.value);
+    }));
+
+    sheet.append(cap("Тип значения"));
+    sheet.append(pick(TYPE_NAMES, draft.vtype, function (e) {
+      draft.vtype = e.target.value;
+      draw();
+    }));
+
+    if (draft.scope === "project") {
+      sheet.append(cap("Значение переменной"));
+      sheet.append(line(draft.value, draft.vtype === "number" ? "0" : "Значение",
+        function (e) { draft.value = e.target.value; }));
+    }
+
+    sheet.append(cap("Описание переменной"));
+    sheet.append(line(draft.descr, "Дополнительная информация", function (e) {
+      draft.descr = e.target.value;
+    }));
+
+    if (item) {
+      var box = el("input", {type: "checkbox", onchange: function (e) {
+        draft.archived = e.target.checked;
+      }});
+      box.checked = !!draft.archived;
+      sheet.append(el("label", {class: "check"}, box,
+        el("span", {}, "В архив — убрать из подсказок")));
+    }
+
+    var go = el("button", {class: "wide"}, item ? "Сохранить" : "Создать");
+    go.addEventListener("click", async function () {
+      if (!draft.name) { flash("Впишите название"); return; }
+      go.disabled = true;
+      try {
+        VARS = (await api("/api/vars/save",
+          {method: "POST", body: JSON.stringify(draft)})).vars;
+        closePopups();
+        openVars();
+      } catch (e) {
+        flash(e.message, "long");
+        go.disabled = false;
+      }
+    });
+    sheet.append(go);
+    sheet.append(el("button", {class: "wide ghost", onclick: function () {
+      closePopups();
+      openVars();
+    }}, "Отмена"));
+
+    if (item) {
+      sheet.append(armed(el("button", {class: "wide kill"}, "Удалить переменную"),
+        "Точно удалить?", async function () {
+          try {
+            VARS = (await api("/api/vars/delete",
+              {method: "POST", body: JSON.stringify({name: item.name})})).vars;
+            closePopups();
+            openVars();
+          } catch (e) { flash(e.message, "long"); }
+        }));
+    }
+    popup(sheet);
+  }
+  draw();
+}
+
+function openTags() {
+  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  sheet.append(el("h3", {}, "Теги"));
+  sheet.append(el("div", {class: "note"},
+    "Тегом отмечают людей: «новичок», «купил», «ждёт звонка». " +
+    "По тегу можно сделать развилку в схеме или отправить рассылку только своим."));
+
+  var rows = el("div", {class: "rows"});
+  if (!TAGS.length) rows.append(el("div", {class: "empty"}, "Пока ни одного."));
+  TAGS.forEach(function (name) {
+    rows.append(el("div", {class: "rw"},
+      el("div", {class: "grow"}, el("span", {class: "pill tag"}, name)),
+      armed(el("button", {class: "mini kill"}, "🗑"), "✓", async function () {
+        try {
+          TAGS = (await api("/api/tags/delete",
+            {method: "POST", body: JSON.stringify({name: name})})).tags;
+          closePopups();
+          openTags();
+        } catch (e) { flash(e.message, "long"); }
+      })));
+  });
+  sheet.append(rows);
+
+  var field = el("input", {class: "inp", placeholder: "Например: важный клиент",
+                           style: "margin-top:12px"});
+  var go = el("button", {class: "wide"}, "Создать тег");
+  go.addEventListener("click", async function () {
+    var name = cleanName(field.value);
+    if (!name) { flash("Впишите название"); return; }
+    go.disabled = true;
+    try {
+      TAGS = (await api("/api/tags/save",
+        {method: "POST", body: JSON.stringify({name: name})})).tags;
+      closePopups();
+      openTags();
+    } catch (e) {
+      flash(e.message, "long");
+      go.disabled = false;
+    }
+  });
+  sheet.append(field, go);
+  popup(sheet);
+}
+
+async function openPeople() {
+  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  var rows = el("div", {class: "rows"}, el("div", {class: "empty"}, "Загружаю…"));
+  sheet.append(el("h3", {}, "Люди"), rows);
+  sheet.append(el("button", {class: "wide", onclick: openBroadcast}, "Отправить рассылку"));
+  popup(sheet);
+
+  var people = [];
+  try {
+    people = (await api("/api/users")).people || [];
+  } catch (e) {
+    flash(e.message, "long");
+  }
+  rows.textContent = "";
+  if (!people.length) {
+    rows.append(el("div", {class: "empty"},
+      "Пока никто не писал вашему боту."));
+    return;
+  }
+  people.forEach(function (person) {
+    var tags = el("div", {});
+    (person.tags || []).forEach(function (name) {
+      tags.append(el("span", {class: "pill tag"}, name));
+    });
+    rows.append(el("div", {class: "rw"},
+      el("div", {class: "grow"},
+        el("b", {}, person.name + (person.username ? " @" + person.username : "")),
+        el("small", {}, (person.subscribed ? "подписан" : "отписан") +
+                        " · " + when(person.last)),
+        tags),
+      el("button", {class: "mini", onclick: function () {
+        openPersonTags(person);
+      }}, "🏷")));
+  });
+}
+
+function openPersonTags(person) {
+  var chosen = (person.tags || []).slice();
+  var sheet = el("div", {class: "sheet", id: "sheet"});
+  sheet.append(el("h3", {}, "Теги: " + person.name));
+
+  function draw() {
+    var rows = el("div", {class: "rows"});
+    if (!TAGS.length) {
+      rows.append(el("div", {class: "empty"},
+        "Тегов пока нет — создайте их на странице «Теги»."));
+    }
+    TAGS.forEach(function (name) {
+      var on = chosen.indexOf(name) >= 0;
+      rows.append(el("div", {class: "rw"},
+        el("div", {class: "grow"}, el("span", {class: "pill tag"}, name)),
+        el("button", {class: "mini", onclick: function () {
+          if (on) chosen = chosen.filter(function (t) { return t !== name; });
+          else chosen.push(name);
+          list.replaceWith(list = draw());
+        }}, on ? "✓" : "+")));
+    });
+    return rows;
+  }
+
+  var list = draw();
+  sheet.append(list);
+  var go = el("button", {class: "wide"}, "Сохранить");
+  go.addEventListener("click", async function () {
+    go.disabled = true;
+    try {
+      await api("/api/users/tags", {method: "POST",
+        body: JSON.stringify({chat_id: person.chat_id, tags: chosen})});
+      closePopups();
+      openPeople();
+    } catch (e) {
+      flash(e.message, "long");
+      go.disabled = false;
+    }
+  });
+  sheet.append(go);
+  popup(sheet);
+}
+
+function openBroadcast() {
+  var sheet = el("div", {class: "sheet", id: "sheet"});
+  sheet.append(el("h3", {}, "Рассылка"));
+  sheet.append(el("div", {class: "note"},
+    "Уйдёт всем, кто не отписался. Подставляются переменные: {name}, {username}."));
+
+  var text = area("", "Что написать людям", function () {});
+  sheet.append(cap("Текст"), text);
+  sheet.append(cap("Только с тегом"));
+  var only = pick([["", "— всем —"]].concat(TAGS.map(function (t) { return [t, t]; })),
+                  "", function () {});
+  sheet.append(only);
+
+  var go = el("button", {class: "wide"}, "Отправить");
+  armed(go, "Точно отправить?", async function () {
+    if (!text.value.trim()) { flash("Напишите текст"); return; }
+    go.disabled = true;
+    try {
+      var result = await api("/api/broadcast", {method: "POST",
+        body: JSON.stringify({text: text.value, tag: only.value})});
+      closePopups();
+      flash("Рассылка пошла: " + result.people + " чел.", "long");
+    } catch (e) {
+      flash(e.message, "long");
+      go.disabled = false;
+      go.textContent = "Отправить";
+    }
+  });
+  sheet.append(go);
+  popup(sheet);
+}
+
+function addStep(type, at) {
   var canvas = document.getElementById("canvas");
   var step = blankStep(type);
-  step.x = Math.round((canvas.clientWidth / 2 - PAN.x) / PAN.z - NODE_W / 2);
-  step.y = Math.round((canvas.clientHeight / 2 - PAN.y) / PAN.z - 70);
+  if (at) {                              /* добавили двойным касанием — сюда же */
+    step.x = Math.round(at.x - NODE_W / 2);
+    step.y = Math.round(at.y - 40);
+  } else {
+    step.x = Math.round((canvas.clientWidth / 2 - PAN.x) / PAN.z - NODE_W / 2);
+    step.y = Math.round((canvas.clientHeight / 2 - PAN.y) / PAN.z - 70);
+  }
   S.steps.push(step);
   if (!S.start && type !== "note") S.start = step.id;
   touch();
@@ -2758,7 +4304,12 @@ async function save() {
   button.disabled = true;
   button.textContent = "Сохраняю…";
   try {
-    await api("/api/scenario", {method: "POST", body: JSON.stringify({scenario: S})});
+    var result = await api("/api/scenario",
+      {method: "POST", body: JSON.stringify({scenario: S})});
+    /* Имена, написанные прямо на схеме, сервис заносит в общие списки —
+       забираем их обратно, чтобы подсказки сразу о них знали. */
+    if (result.vars) VARS = result.vars;
+    if (result.tags) TAGS = result.tags;
     DIRTY = false;
     paintSave();
     if (!S.start) flash("Сохранено, но стартовый блок не отмечен — бот не ответит на /start", "long");
@@ -2818,12 +4369,17 @@ async function disconnect() {
     BOT.connected = state.connected;
     BOT.bot_username = state.bot_username;
     BOT.people = state.people;
+    VARS = state.vars || [];
+    TAGS = state.tags || [];
 
     boot.hidden = true;
     document.getElementById("stage").hidden = false;
 
-    document.getElementById("plus").addEventListener("click", openPalette);
+    document.getElementById("plus").addEventListener("click", function () { openPalette(); });
     document.getElementById("menuBtn").addEventListener("click", openMenu);
+    document.getElementById("varsBtn").addEventListener("click", openVars);
+    document.getElementById("tagsBtn").addEventListener("click", openTags);
+    document.getElementById("peopleBtn").addEventListener("click", openPeople);
     document.getElementById("chip").addEventListener("click", openBotSheet);
     document.getElementById("save").addEventListener("click", save);
     document.getElementById("zoomIn").addEventListener("click", function () { zoomBy(1.2); });

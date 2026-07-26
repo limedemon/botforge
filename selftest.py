@@ -54,6 +54,16 @@ async def fake_tg(token, method, **params):
 
 main.tg = fake_tg
 
+# Скачивание присланных картинок тоже подменяем: наружу не ходим.
+FAKE_IMAGE = b"\x89PNG\r\n\x1a\n" + "это не настоящая картинка".encode("utf-8")
+
+
+async def fake_download(token, file_id):
+    return b"" if file_id == "неподъёмная" else FAKE_IMAGE
+
+
+main.tg_download = fake_download
+
 
 def check(name, condition, detail=""):
     if condition:
@@ -110,9 +120,10 @@ async def run():
     # иначе проверки увидят чужую схему и всё «сломается» на ровном месте.
     stale = await main.db.fetchrow("SELECT * FROM projects WHERE owner_id = $1", OWNER)
     if stale:
-        await main.db.execute("DELETE FROM sessions WHERE project_id = $1", stale["id"])
-        await main.db.execute("DELETE FROM timers WHERE project_id = $1", stale["id"])
+        for table in ("sessions", "timers", "variables", "tags"):
+            await main.db.execute(f"DELETE FROM {table} WHERE project_id = $1", stale["id"])
         await main.db.execute("DELETE FROM projects WHERE owner_id = $1", OWNER)
+    await main.db.execute("DELETE FROM assets WHERE owner_id = $1", OWNER)
     CALLS.clear()
 
     print("\n1. Страница и здоровье сервиса")
@@ -444,12 +455,313 @@ async def run():
         "from": {"id": 1, "first_name": "Г"}, "text": "/start"}})
     check("в группах бот не отвечает", not CALLS, str(CALLS))
 
+    print("\n15. Переменные: текстовые и числовые")
+
+    async def make_var(name, scope="user", vtype="text", value=""):
+        resp = await client.post("/api/vars/save", headers=headers, json={
+            "name": name, "scope": scope, "vtype": vtype, "value": value})
+        assert resp.status == 200, await resp.text()
+        return (await resp.json())["vars"]
+
+    async def var_now(name):
+        row = await main.db.fetchrow(
+            "SELECT * FROM variables WHERE project_id = $1 AND name = $2",
+            project["id"], name)
+        return row
+
+    async def person_var(chat_id, name):
+        session = await main.load_session(project["id"], chat_id)
+        return session["vars"].get(name)
+
+    await make_var("счёт", "user", "number", "")
+    await make_var("имя клиента", "user", "text")
+    await make_var("наш сайт", "project", "text", "https://example.com")
+
+    resp = await client.get("/api/vars", headers=headers)
+    names = {v["name"]: v for v in (await resp.json())["vars"]}
+    check("переменная числового типа создана",
+          names.get("счёт", {}).get("vtype") == "number", str(names.get("счёт")))
+    check("название из нескольких слов сохранилось", "имя клиента" in names, str(list(names)))
+    check("проектная переменная хранит своё значение",
+          names.get("наш сайт", {}).get("value") == "https://example.com",
+          str(names.get("наш сайт")))
+
+    resp = await client.post("/api/vars/save", headers=headers, json={
+        "name": "счёт", "scope": "user", "vtype": "number"})
+    check("двух переменных с одним названием не бывает", resp.status in (200, 400))
+
+    await use({"start": "start", "steps": [
+        step("message", id="start", text="Считаем", buttons=[], next="add"),
+        step("action", id="add", next="show", actions=[
+            {"kind": "set_var", "name": "счёт", "op": "add", "value": "3"},
+            {"kind": "set_var", "name": "имя клиента", "op": "mul", "value": "Петя"},
+        ]),
+        step("message", id="show", buttons=[], next="",
+             text="счёт {счёт}, имя {имя клиента}, сайт {наш сайт}"),
+    ]})
+    await send(text="/start", chat=700)
+    check("к числовой переменной прибавилось",
+          any("счёт 3," in t for t in texts()), str(texts()))
+    check("знак у текстовой переменной не действует — она просто записана",
+          any("имя Петя," in t for t in texts()), str(texts()))
+    check("проектная переменная подставилась в текст",
+          any("https://example.com" in t for t in texts()), str(texts()))
+
+    await send(text="/start", chat=700)
+    check("прибавление накапливается", any("счёт 6," in t for t in texts()), str(texts()))
+    await send(text="/start", chat=701)
+    check("у другого человека свой счёт", any("счёт 3," in t for t in texts()), str(texts()))
+
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="show", actions=[
+            {"kind": "set_var", "name": "счёт", "op": "set", "value": "10"},
+            {"kind": "set_var", "name": "счёт", "op": "div", "value": "4"},
+            {"kind": "set_var", "name": "счёт", "op": "sub", "value": "0,5"},
+        ]),
+        step("message", id="show", text="итого {счёт}", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=702)
+    check("деление и дробное вычитание считаются",
+          any("итого 2" == t for t in texts()), str(texts()))
+
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="show", actions=[
+            {"kind": "set_var", "name": "счёт", "op": "set", "value": "5"},
+            {"kind": "set_var", "name": "счёт", "op": "set", "value": "{счёт} * 2 + 1"},
+        ]),
+        step("message", id="show", text="итого {счёт}", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=703)
+    check("выражение со знаками посчиталось",
+          any("итого 11" == t for t in texts()), str(texts()))
+
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="show", actions=[
+            {"kind": "set_var", "name": "наш сайт", "op": "set", "value": "https://new.ru"},
+        ]),
+        step("message", id="show", text="сайт {наш сайт}", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=704)
+    row = await var_now("наш сайт")
+    check("проектная переменная записалась в базу, а не в сеанс",
+          row and row["value"] == "https://new.ru", str(row and row["value"]))
+    await send(text="/start", chat=705)
+    check("новое значение проектной переменной видно всем",
+          any("https://new.ru" in t for t in texts()), str(texts()))
+    check("проектная переменная не осела в личных данных",
+          await person_var(705, "наш сайт") is None)
+
+    print("\n16. Числа в условиях и в блоке «Ввод»")
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="c",
+             actions=[{"kind": "set_var", "name": "счёт", "op": "set", "value": "9"}]),
+        step("condition", id="c", next="yes", otherwise="no",
+             checks=[{"var": "счёт", "op": "lt", "value": "12"}]),
+        step("message", id="yes", text="Меньше", buttons=[], next=""),
+        step("message", id="no", text="Не меньше", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=710)
+    check("девять меньше двенадцати, а не наоборот",
+          texts() == ["Меньше"], str(texts()))
+
+    await use({"start": "ask", "steps": [
+        step("input", id="ask", text="Сколько вам лет?", save_to="счёт",
+             expect="number", retry="Нужно число!", next="ok"),
+        step("message", id="ok", text="Записал {счёт}", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=711)
+    await send(text="много", chat=711)
+    check("вместо числа буквы — бот переспрашивает",
+          texts() == ["Нужно число!"], str(texts()))
+    await send(text="30", chat=711)
+    check("число принято и записано", texts() == ["Записал 30"], str(texts()))
+
+    print("\n17. Картинки из галереи")
+    main_path = f"/hook/main/{main.MAIN_SECRET}"
+    CALLS.clear()
+    await client.post(main_path, json={"message": {
+        "chat": {"id": OWNER, "type": "private"}, "from": {"id": OWNER},
+        "photo": [{"file_id": "мелкая"}, {"file_id": "крупная"}]}})
+    check("на присланную картинку бот ответил", bool(texts("sendMessage") or CALLS),
+          str(CALLS)[:200])
+    resp = await client.get("/api/assets", headers=headers)
+    shots = (await resp.json())["assets"]
+    check("картинка попала в галерею", len(shots) == 1, str(shots))
+
+    token = shots[0]["token"] if shots else "нет"
+    resp = await client.get("/img/" + token)
+    check("картинка отдаётся по своему адресу",
+          resp.status == 200 and (await resp.read()) == FAKE_IMAGE,
+          str(resp.status))
+    resp = await client.get("/img/выдуманная-метка")
+    check("выдуманная метка ничего не открывает", resp.status == 404)
+
+    await use({"start": "m", "steps": [
+        step("message", id="m", text="Вот картинка", photo="asset:" + token,
+             file="", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=720)
+    shot_calls = [c for c in CALLS if c["method"] == "sendPhoto"]
+    check("бот отправил картинку из галереи",
+          len(shot_calls) == 1 and shot_calls[0]["photo"].endswith("/img/" + token),
+          str(shot_calls)[:200])
+
+    await use({"start": "m", "steps": [
+        step("message", id="m", text="Так нельзя", photo="javascript:alert(1)",
+             file="", buttons=[], next=""),
+    ]})
+    saved = (await (await client.get("/api/state", headers=headers)).json())["scenario"]
+    check("постороннюю ссылку вместо картинки не принимают",
+          saved["steps"][0]["photo"] == "", str(saved["steps"][0]))
+
+    resp = await client.post("/api/assets/delete", headers=headers,
+                             json={"token": token})
+    shots = (await (await client.get("/api/assets", headers=headers)).json())["assets"]
+    check("картинку можно убрать из галереи", not shots, str(shots))
+
+    print("\n18. Теги, люди и рассылка")
+    resp = await client.post("/api/tags/save", headers=headers, json={"name": "новичок"})
+    check("тег создан", "новичок" in (await resp.json())["tags"])
+
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="m", actions=[
+            {"kind": "add_tag", "name": "новичок", "value": ""},
+        ]),
+        step("message", id="m", text="Готово", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=730, who="Маша")
+    await send(text="/start", chat=731, who="Гриша")
+
+    # Прошлые разделы наплодили десятки собеседников. Для рассылки оставляем
+    # только этих двоих — иначе проверка ждала бы её конца полминуты.
+    await main.db.execute(
+        "DELETE FROM sessions WHERE project_id = $1 AND chat_id NOT IN (730, 731)",
+        project["id"])
+
+    people = (await (await client.get("/api/users", headers=headers)).json())["people"]
+    mine = {p["chat_id"]: p for p in people}
+    check("люди видны списком", 730 in mine and 731 in mine, str(list(mine))[:200])
+    check("имя человека видно", mine.get(730, {}).get("name") == "Маша", str(mine.get(730)))
+    check("тег из действия виден в списке",
+          mine.get(730, {}).get("tags") == ["новичок"], str(mine.get(730)))
+    check("по умолчанию человек подписан на рассылку",
+          mine.get(730, {}).get("subscribed") is True, str(mine.get(730)))
+
+    await client.post("/api/users/tags", headers=headers,
+                      json={"chat_id": 731, "tags": ["новичок", "важный"]})
+    people = (await (await client.get("/api/users", headers=headers)).json())["people"]
+    mine = {p["chat_id"]: p for p in people}
+    check("теги человека можно поправить руками",
+          mine.get(731, {}).get("tags") == ["новичок", "важный"], str(mine.get(731)))
+    check("новый тег завёлся в общем списке",
+          "важный" in (await (await client.get("/api/tags", headers=headers)).json())["tags"])
+
+    await use({"start": "s", "steps": [
+        step("action", id="s", next="m",
+             actions=[{"kind": "unsubscribe", "name": "", "value": ""}]),
+        step("message", id="m", text="Отписал", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=731)
+    people = (await (await client.get("/api/users", headers=headers)).json())["people"]
+    mine = {p["chat_id"]: p for p in people}
+    check("действие «отписать» сработало",
+          mine.get(731, {}).get("subscribed") is False, str(mine.get(731)))
+
+    CALLS.clear()
+    resp = await client.post("/api/broadcast", headers=headers,
+                             json={"text": "Здравствуйте, {name}!", "tag": ""})
+    body = await resp.json()
+    check("рассылка принята", resp.status == 200, str(body))
+    await asyncio.sleep(0.6)
+    sent = {c["chat_id"] for c in CALLS if c["method"] == "sendMessage"}
+    check("отписавшийся рассылку не получил", 731 not in sent, str(sent))
+    check("подписанный рассылку получил", 730 in sent, str(sent))
+    check("в рассылке подставилось имя",
+          any("Здравствуйте, Маша!" == c.get("text") for c in CALLS), str(CALLS)[:300])
+
+    CALLS.clear()
+    await client.post("/api/broadcast", headers=headers,
+                      json={"text": "Только своим", "tag": "нет такого тега"})
+    await asyncio.sleep(0.4)
+    check("рассылка по несуществующему тегу никому не ушла",
+          not [c for c in CALLS if c["method"] == "sendMessage"], str(CALLS)[:200])
+    CALLS.clear()
+
+    await client.post("/api/tags/delete", headers=headers, json={"name": "важный"})
+    people = (await (await client.get("/api/users", headers=headers)).json())["people"]
+    mine = {p["chat_id"]: p for p in people}
+    check("удалённый тег снялся и с людей",
+          mine.get(731, {}).get("tags") == ["новичок"], str(mine.get(731)))
+
+    print("\n19. Кнопки внутри сообщения и разметка")
+    await use({"start": "m", "steps": [
+        step("message", id="m", text="<b>Жирно</b>", buttons=[
+            {"text": "Дальше", "action": "goto", "value": "n"},
+            {"text": "Сайт", "action": "url", "value": "https://example.com"},
+        ], inline=True, next=""),
+        step("message", id="n", text="Второй", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=740)
+    said = [c for c in CALLS if c["method"] == "sendMessage"][0]
+    rows = (said.get("reply_markup") or {}).get("inline_keyboard") or []
+    check("кнопки ушли внутрь сообщения", len(rows) == 2, str(said.get("reply_markup")))
+    check("кнопка-переход несёт номер блока",
+          bool(rows) and rows[0][0].get("callback_data") == "g:n", str(rows))
+    check("кнопка-ссылка стала настоящей ссылкой",
+          len(rows) > 1 and rows[1][0].get("url") == "https://example.com", str(rows))
+    check("текст ушёл с разметкой", said.get("parse_mode") == "HTML", str(said)[:200])
+    await tap("g:n", chat=740)
+    check("нажатие внутренней кнопки уводит на нужный блок",
+          texts() == ["Второй"], str(texts()))
+
+    print("\n20. Рандом закрепляется за человеком")
+    await use({"start": "r", "steps": [
+        step("random", id="r", always=False, options=[
+            {"label": "A", "weight": 50, "next": "a"},
+            {"label": "B", "weight": 50, "next": "b"},
+        ]),
+        step("message", id="a", text="Вариант А", buttons=[], next=""),
+        step("message", id="b", text="Вариант Б", buttons=[], next=""),
+    ]})
+    await send(text="/start", chat=750)
+    first = texts()
+    same = True
+    for _ in range(6):
+        await send(text="/start", chat=750)
+        same = same and texts() == first
+    check("выпавший вариант закрепился за человеком", same, str(first))
+
+    await use({"start": "r", "steps": [
+        step("random", id="r", always=True, options=[
+            {"label": "A", "weight": 50, "next": "a"},
+            {"label": "B", "weight": 50, "next": "b"},
+        ]),
+        step("message", id="a", text="Вариант А", buttons=[], next=""),
+        step("message", id="b", text="Вариант Б", buttons=[], next=""),
+    ]})
+    seen = set()
+    for _ in range(40):
+        await send(text="/start", chat=751)
+        seen.update(texts())
+    check("с галочкой «заново каждый раз» выпадает по-разному",
+          len(seen) == 2, str(seen))
+
+    print("\n21. Старые действия и старые схемы")
+    moved = main.refresh_actions({"steps": [{"id": "a", "type": "action", "actions": [
+        {"kind": "del_var", "name": "город", "value": "что-то"}]}]})
+    was = moved["steps"][0]["actions"][0]
+    check("«удалить переменную» стало пустой записью",
+          was["kind"] == "set_var" and was["value"] == "" and was["op"] == "set", str(was))
+
     resp = await client.post("/api/bot/disconnect", headers=headers)
     check("бота можно отключить", resp.status == 200)
     resp = await client.get("/api/state", headers=headers)
     check("после отключения бот отвязан", (await resp.json())["connected"] is False)
 
-    print("\n15. Уборка за собой")
+    print("\n22. Уборка за собой")
+    for table in ("variables", "tags"):
+        await main.db.execute(f"DELETE FROM {table} WHERE project_id = $1", project["id"])
+    await main.db.execute("DELETE FROM assets WHERE owner_id = $1", OWNER)
     await main.db.execute("DELETE FROM sessions WHERE project_id = $1", project["id"])
     await main.db.execute("DELETE FROM timers WHERE project_id = $1", project["id"])
     await main.db.execute("DELETE FROM projects WHERE owner_id = $1", OWNER)
@@ -512,8 +824,11 @@ const api = new Function(
   "window", "document", "location", "sessionStorage", "fetch", "setTimeout", "clearTimeout",
   code + "\nreturn {" +
   "  getS: () => S, setS: (v) => { S = v; }," +
+  "  setVARS: (v) => { VARS = v; }, setTAGS: (v) => { TAGS = v; }," +
   "  outputsOf, setLink, autoLayout, ensurePositions, removeStep, blankStep," +
-  "  nextId, byId, titleOf, META, ORDER" +
+  "  nextId, byId, titleOf, META, ORDER," +
+  "  cleanName, isNumberVar, varItems, tagItems, shotSrc," +
+  "  ACTION_NAMES, SET_OPS, OP_NAMES" +
   "};"
 )(window, document, location, sessionStorage, fetch, () => 0, () => {});
 
@@ -603,12 +918,63 @@ check("после удаления ветка «нет» пустая", R[0].oth
 check("после удаления вариант рандома пустой", R[0].options[0].next === "");
 check("стартовым стал оставшийся блок", api.getS().start === "a");
 
+/* --- заготовки новых блоков знают про новые поля --- */
+const blankMsg = api.blankStep("message");
+const blankIn = api.blankStep("input");
+const blankRnd = api.blankStep("random");
+check("у нового сообщения кнопки под полем ввода", blankMsg.inline === false);
+check("новый ввод принимает что угодно", blankIn.expect === "any");
+check("новый рандом закрепляет вариант", blankRnd.always === false);
+
+/* --- названия переменных и тегов --- */
+check("из названия убирается лишнее",
+      api.cleanName("  Имя:  клиента!! ") === "Имя клиента",
+      api.cleanName("  Имя:  клиента!! "));
+check("название не длиннее сорока знаков",
+      api.cleanName("я".repeat(60)).length === 40);
+
+api.setVARS([
+  {name: "счёт", scope: "user", vtype: "number", archived: false},
+  {name: "город", scope: "user", vtype: "text", archived: false},
+  {name: "сайт", scope: "project", vtype: "text", archived: false},
+  {name: "старое", scope: "user", vtype: "text", archived: true},
+]);
+api.setTAGS(["новичок"]);
+check("числовая переменная опознана", api.isNumberVar("счёт") === true);
+check("текстовая переменная не числовая", api.isNumberVar("город") === false);
+check("незнакомая переменная не числовая", api.isNumberVar("чего-то") === false);
+check("в подсказках нет архивных", api.varItems().length === 3,
+      JSON.stringify(api.varItems()));
+check("проектная переменная помечена цветом",
+      api.varItems().filter((v) => v.tone === "project").length === 1);
+check("тип переменной виден в подсказке",
+      api.varItems()[0].kind === "число", JSON.stringify(api.varItems()[0]));
+check("теги тоже подсказываются", api.tagItems().length === 1);
+
+/* --- картинка из галереи и обычная ссылка --- */
+check("картинка из галереи открывается по своему адресу",
+      api.shotSrc("asset:abc123") === "/img/abc123");
+check("обычная ссылка остаётся как есть",
+      api.shotSrc("https://example.com/a.jpg") === "https://example.com/a.jpg");
+
+/* --- набор действий совпадает с тем, что понимает движок --- */
+check("действий ровно шесть", api.ACTION_NAMES.length === 6);
+check("«удалить переменную» из списка убрано",
+      !api.ACTION_NAMES.some((a) => a[0] === "del_var"));
+check("есть подписка и отписка от рассылки",
+      api.ACTION_NAMES.some((a) => a[0] === "subscribe") &&
+      api.ACTION_NAMES.some((a) => a[0] === "unsubscribe"));
+check("знаков у переменной пять", api.SET_OPS.length === 5,
+      JSON.stringify(api.SET_OPS));
+check("в условиях есть сравнение чисел",
+      ["gt", "lt", "gte", "lte"].every((op) => api.OP_NAMES.some((o) => o[0] === op)));
+
 process.stdout.write(JSON.stringify(results));
 """
 
 
 def check_editor_logic():
-    print("\n16. Полотно в редакторе (логика страницы)")
+    print("\n23. Полотно в редакторе (логика страницы)")
     if not shutil.which("node"):
         print("  — пропущено: не установлен Node.js")
         return
