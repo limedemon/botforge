@@ -828,6 +828,7 @@ const api = new Function(
   "  outputsOf, setLink, autoLayout, ensurePositions, removeStep, blankStep," +
   "  nextId, byId, titleOf, META, ORDER," +
   "  cleanName, isNumberVar, varItems, tagItems, shotSrc, nodeEl, inletY," +
+  "  armCut, cutLink, dropCut, getCUT: () => CUT," +
   "  ACTION_NAMES, SET_OPS, OP_NAMES" +
   "};"
 )(window, document, location, sessionStorage, fetch, () => 0, () => {});
@@ -943,6 +944,35 @@ check("свободный выход не закрашен",
       !dotsOf("b").some((c) => c.indexOf("wired") >= 0), dotsOf("b").join(" | "));
 check("стрелка в никуда выход не закрашивает",
       !dotsOf("c").some((c) => c.indexOf("wired") >= 0), dotsOf("c").join(" | "));
+
+/* --- нажатие по линии и корзина --- */
+api.setS({start: "a", steps: [
+  {id: "a", type: "message", name: "", text: "", buttons: [
+    {text: "к", action: "goto", value: "b"}], next: "b", x: 0, y: 0},
+  {id: "b", type: "message", name: "", text: "", buttons: [], next: "", x: 0, y: 0},
+]});
+api.armCut("a", 1, {x: 50, y: 60});
+check("нажатие по линии запомнило, какую убирать",
+      !!api.getCUT() && api.getCUT().id === "a" && api.getCUT().out === 1,
+      JSON.stringify(api.getCUT()));
+check("корзина встала туда, где нажали",
+      api.getCUT().x === 50 && api.getCUT().y === 60);
+api.cutLink();
+check("корзина убрала стрелку «следующий шаг»", api.byId("a").next === "");
+check("соседняя стрелка от кнопки цела", api.byId("a").buttons[0].value === "b");
+check("после удаления корзина пропала", api.getCUT() === null);
+
+api.armCut("a", 0, {x: 1, y: 2});
+api.cutLink();
+check("корзина убирает и стрелку от кнопки", api.byId("a").buttons[0].value === "");
+
+api.armCut("нет такого блока", 0, {x: 1, y: 2});
+check("по стрелке исчезнувшего блока корзина не появляется", api.getCUT() === null);
+api.armCut("a", 0, {x: 1, y: 2});
+api.dropCut();
+check("корзину можно просто закрыть", api.getCUT() === null);
+api.cutLink();
+check("закрытая корзина ничего не удаляет", true);
 
 /* --- линия входит в блок снизу, а не в середину --- */
 const tallNode = {offsetHeight: 200, querySelectorAll: () => []};

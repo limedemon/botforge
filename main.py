@@ -2297,8 +2297,16 @@ button{cursor:pointer}
 .wire{fill:none;stroke:#9db4c9;stroke-width:2}
 .wire.yes{stroke:#2fbf87}
 .wire.no{stroke:#e2483d}
-/* Конец линии — такой же закрашенный кружок, как и её начало. */
-.wire-end{fill:#9db4c9}
+/* Вход в блок — такой же полый кружок, как и выход из него. */
+.wire-end{fill:#fff;stroke:#9db4c9;stroke-width:2}
+/* Невидимая полоса поверх линии: попасть пальцем в тонкую линию нельзя,
+   а в такую — легко. Она и ловит касание. */
+.wire-hit{fill:none;stroke:transparent;stroke-width:18;pointer-events:stroke;
+          cursor:pointer}
+.cut{position:absolute;width:34px;height:34px;border:none;border-radius:10px;
+     background:#fff;color:var(--danger);font-size:18px;font-weight:800;
+     -webkit-text-stroke:.7px currentColor;transform-origin:50% 100%;
+     box-shadow:0 3px 12px rgba(21,40,60,.28)}
 
 /* ---------- блок ---------- */
 .node{position:absolute;width:210px;border-radius:12px;background:#fff;color:var(--ink);
@@ -2348,9 +2356,13 @@ button{cursor:pointer}
        border-radius:11px;background:#1fa463;color:#fff;font-size:11px;font-weight:600;
        white-space:nowrap}
 .side{position:absolute;left:100%;top:0;margin-left:8px;display:flex;flex-direction:column;
-      gap:6px}
-.side button{width:30px;height:30px;border:none;border-radius:9px;background:#fff;
-             color:var(--soft);font-size:14px;box-shadow:0 2px 8px rgba(21,40,60,.16)}
+      gap:7px}
+/* Значки рисуются тонким контуром — обводкой добавляем им толщины,
+   чтобы они были такими же плотными, как скобки наверху. */
+.side button{width:36px;height:36px;border:none;border-radius:10px;background:#fff;
+             color:var(--soft);font-size:19px;font-weight:800;
+             -webkit-text-stroke:.7px currentColor;
+             box-shadow:0 2px 8px rgba(21,40,60,.16)}
 .side button.kill{color:var(--danger)}
 
 /* ---------- верх и низ ---------- */
@@ -2767,6 +2779,7 @@ function cleanName(text) {
 }
 var SEL = "";             /* какой блок выбран */
 var LINKING = null;       /* {id, out} — от какого кружка тянем стрелку */
+var CUT = null;           /* {id, out, x, y} — по какой линии нажали */
 var PAN = {x: 40, y: 90, z: 1, ready: false};
 var NODES = {};
 var DIRTY = false;
@@ -2900,6 +2913,7 @@ function applyPan() {
 }
 
 function fitView() {
+  dropCut();
   var canvas = document.getElementById("canvas");
   if (!S.steps.length || !canvas.clientWidth) return;
   var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -2916,6 +2930,7 @@ function fitView() {
 }
 
 function zoomBy(factor) {
+  dropCut();                       /* корзина прибита к своему масштабу */
   var canvas = document.getElementById("canvas");
   var cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2;
   var wx = (cx - PAN.x) / PAN.z, wy = (cy - PAN.y) / PAN.z;
@@ -2925,10 +2940,10 @@ function zoomBy(factor) {
   applyPan();
 }
 
-function wirePath(x1, y1, x2, y2, tone) {
+function wirePath(x1, y1, x2, y2, tone, kind) {
   var bend = Math.max(40, Math.abs(x2 - x1) / 2);
   var path = document.createElementNS(SVGNS, "path");
-  path.setAttribute("class", "wire " + (tone || ""));
+  path.setAttribute("class", kind || ("wire " + (tone || "")));
   path.setAttribute("d", "M " + x1 + " " + y1 +
     " C " + (x1 + bend) + " " + y1 + ", " + (x2 - bend) + " " + y2 +
     ", " + x2 + " " + y2);
@@ -2965,11 +2980,18 @@ function drawWires() {
       var x2 = target.x;
       var y2 = target.y + inletY(to);
       svg.append(wirePath(x1, y1, x2, y2, out.tone));
+
+      // Широкая прозрачная полоса поверх линии — по ней и попадают пальцем.
+      var hit = wirePath(x1, y1, x2, y2, "", "wire-hit");
+      hit.setAttribute("data-from", step.id);
+      hit.setAttribute("data-out", index);
+      svg.append(hit);
+
       var end = document.createElementNS(SVGNS, "circle");
       end.setAttribute("class", "wire-end");
       end.setAttribute("cx", x2);
       end.setAttribute("cy", y2);
-      end.setAttribute("r", 5);
+      end.setAttribute("r", 5.5);
       svg.append(end);
     });
   });
@@ -3101,6 +3123,7 @@ function attachDrag(node, step) {
   node.addEventListener("pointerdown", function (e) {
     if (e.button === 1 || e.button === 2) return;
     e.stopPropagation();                     /* иначе поедет всё полотно */
+    dropCut();                               /* корзина с линии больше не нужна */
     grab = {x: e.clientX, y: e.clientY, sx: step.x, sy: step.y, moved: false};
     try { node.setPointerCapture(e.pointerId); } catch (err) {}
     node.classList.add("dragging");
@@ -3134,6 +3157,7 @@ function attachDrag(node, step) {
 function armPort(step, outIndex) {
   var same = LINKING && LINKING.id === step.id && LINKING.out === outIndex;
   LINKING = same ? null : {id: step.id, out: outIndex};
+  CUT = null;
   renderCanvas();
 }
 
@@ -3152,6 +3176,7 @@ function linkTo(target) {
 function select(id) {
   SEL = id;
   LINKING = null;
+  CUT = null;
   renderCanvas();
   renderPanel();
 }
@@ -3159,6 +3184,52 @@ function select(id) {
 function deselect() {
   SEL = "";
   LINKING = null;
+  CUT = null;
+  renderCanvas();
+  renderPanel();
+}
+
+/* Нажали по линии — над этим местом показываем корзину. */
+function armCut(stepId, outIndex, at) {
+  var source = byId(stepId);
+  if (!source || !outputsOf(source)[outIndex]) { CUT = null; return; }
+  CUT = {id: stepId, out: outIndex, x: at.x, y: at.y};
+  SEL = "";
+  LINKING = null;
+  renderCanvas();
+  renderPanel();
+}
+
+function dropCut() {
+  if (!CUT) return;
+  CUT = null;
+  var button = document.getElementById("cut");
+  if (button) button.remove();
+}
+
+function cutButton() {
+  return el("button", {
+    class: "cut", id: "cut",
+    /* Корзина живёт на полотне, вместе с линией. Обратным масштабом держим
+       её одного размера на экране, как бы близко ни было приближено. */
+    style: "left:" + CUT.x + "px;top:" + CUT.y + "px;" +
+           "transform:translate(-50%,-124%) scale(" + (1 / PAN.z).toFixed(3) + ")",
+    /* Кнопка лежит на полотне — гасим нажатие, иначе поедет всё полотно. */
+    onpointerdown: function (e) { e.stopPropagation(); },
+    onclick: function (e) {
+      e.stopPropagation();
+      cutLink();
+    },
+  }, "🗑");
+}
+
+/* Убирает ту стрелку, по которой нажали. */
+function cutLink() {
+  if (!CUT) return;
+  var source = byId(CUT.id);
+  if (source) setLink(source, CUT.out, "");
+  CUT = null;
+  touch();
   renderCanvas();
   renderPanel();
 }
@@ -3214,6 +3285,8 @@ function renderCanvas() {
   if (!PAN.ready) { PAN.ready = true; fitView(); } else { applyPan(); }
   drawWires();                    /* высоты блоков известны только теперь */
 
+  if (CUT && byId(CUT.id)) world.append(cutButton());
+
   var tip = document.getElementById("tip");
   tip.hidden = !LINKING;
   if (LINKING) {
@@ -3258,6 +3331,7 @@ function attachCanvas() {
       pan = {x: e.clientX, y: e.clientY, px: PAN.x, py: PAN.y, moved: false};
       try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
     } else if (list.length === 2) {
+      dropCut();
       var box = canvas.getBoundingClientRect();
       var mx = (points[list[0]].x + points[list[1]].x) / 2 - box.left;
       var my = (points[list[0]].y + points[list[1]].y) / 2 - box.top;
@@ -3293,7 +3367,20 @@ function attachCanvas() {
   function release(e) {
     delete points[e.pointerId];
     if (ids().length < 2) pinch = null;
+
+    // Попали по линии — предлагаем её убрать, полотно при этом не трогаем.
+    var target = e.target || {};
+    var from = target.getAttribute ? target.getAttribute("data-from") : null;
+    if (pan && !pan.moved && from) {
+      pan = null;
+      tap = null;
+      armCut(from, +target.getAttribute("data-out"), worldAt(e));
+      if (!ids().length) pan = null;
+      return;
+    }
+
     if (pan && !pan.moved && !onNode(e)) {
+      dropCut();
       var now = new Date().getTime();
       var again = tap && now - tap.at < 340 &&
                   Math.abs(e.clientX - tap.x) < 26 && Math.abs(e.clientY - tap.y) < 26;
@@ -3312,6 +3399,7 @@ function attachCanvas() {
 
   canvas.addEventListener("wheel", function (e) {
     e.preventDefault();
+    dropCut();
     var box = canvas.getBoundingClientRect();
     var mx = e.clientX - box.left, my = e.clientY - box.top;
     var wx = (mx - PAN.x) / PAN.z, wy = (my - PAN.y) / PAN.z;
