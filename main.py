@@ -2297,9 +2297,8 @@ button{cursor:pointer}
 .wire{fill:none;stroke:#9db4c9;stroke-width:2}
 .wire.yes{stroke:#2fbf87}
 .wire.no{stroke:#e2483d}
+/* Конец линии — такой же закрашенный кружок, как и её начало. */
 .wire-end{fill:#9db4c9}
-.wire-end.yes{fill:#2fbf87}
-.wire-end.no{fill:#e2483d}
 
 /* ---------- блок ---------- */
 .node{position:absolute;width:210px;border-radius:12px;background:#fff;color:var(--ink);
@@ -2340,6 +2339,9 @@ button{cursor:pointer}
      transform:translateY(-50%);background:#fff;border:2px solid #9db4c9;cursor:pointer}
 .dot.yes{border-color:#2fbf87}
 .dot.no{border-color:#e2483d}
+/* Из кружка уже тянется линия — закрашиваем, чтобы сразу видеть занятые
+   выходы. Цвет ободка остаётся, иначе «да» и «нет» станут неразличимы. */
+.dot.wired{background:#9db4c9}
 .dot.on{background:#e2483d;border-color:#e2483d;transform:translateY(-50%) scale(1.45)}
 .dot.url{border-color:#c7d2dc;background:#eef2f6;cursor:default}
 .badge{position:absolute;left:50%;top:-11px;transform:translateX(-50%);padding:2px 10px;
@@ -2928,6 +2930,16 @@ function wirePath(x1, y1, x2, y2, tone) {
   return path;
 }
 
+/* Куда линия входит в блок: не в середину левого края, а на той же высоте,
+   на какой линии из блока выходят — вровень с нижней полоской. Так стрелки
+   идут ровно и не перечёркивают блок посередине. */
+function inletY(node) {
+  var ports = node.querySelectorAll ? node.querySelectorAll(".port") : [];
+  var last = ports.length ? ports[ports.length - 1] : null;
+  if (last) return last.offsetTop + last.offsetHeight / 2;
+  return Math.max(0, node.offsetHeight - 18);      /* у заметки полосок нет */
+}
+
 /* Линии рисуем отдельно от блоков: при перетаскивании блок не пересоздаётся,
    перерисовываются только линии. */
 function drawWires() {
@@ -2946,13 +2958,13 @@ function drawWires() {
       var x1 = step.x + from.offsetWidth;
       var y1 = step.y + port.offsetTop + port.offsetHeight / 2;
       var x2 = target.x;
-      var y2 = target.y + to.offsetHeight / 2;
+      var y2 = target.y + inletY(to);
       svg.append(wirePath(x1, y1, x2, y2, out.tone));
       var end = document.createElementNS(SVGNS, "circle");
-      end.setAttribute("class", "wire-end " + (out.tone || ""));
+      end.setAttribute("class", "wire-end");
       end.setAttribute("cx", x2);
       end.setAttribute("cy", y2);
-      end.setAttribute("r", 4);
+      end.setAttribute("r", 5);
       svg.append(end);
     });
   });
@@ -3048,8 +3060,10 @@ function nodeEl(step) {
     var port = el("div", {class: "port" + (out.tail ? " tail" : ""), "data-out": oi},
       el("span", {}, out.label));
     var lit = LINKING && LINKING.id === step.id && LINKING.out === oi;
+    var wired = !!(out.to && byId(out.to));
     var dot = el("span", {class: "dot " + (out.tone || "") +
-                                 (out.kind === "url" ? " url" : "") + (lit ? " on" : "")});
+                                 (out.kind === "url" ? " url" : "") +
+                                 (wired ? " wired" : "") + (lit ? " on" : "")});
     if (out.kind !== "url") {
       /* Кружок не должен таскать блок — гасим начало перетаскивания. */
       dot.addEventListener("pointerdown", function (e) { e.stopPropagation(); });

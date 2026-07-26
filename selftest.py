@@ -827,7 +827,7 @@ const api = new Function(
   "  setVARS: (v) => { VARS = v; }, setTAGS: (v) => { TAGS = v; }," +
   "  outputsOf, setLink, autoLayout, ensurePositions, removeStep, blankStep," +
   "  nextId, byId, titleOf, META, ORDER," +
-  "  cleanName, isNumberVar, varItems, tagItems, shotSrc," +
+  "  cleanName, isNumberVar, varItems, tagItems, shotSrc, nodeEl, inletY," +
   "  ACTION_NAMES, SET_OPS, OP_NAMES" +
   "};"
 )(window, document, location, sessionStorage, fetch, () => 0, () => {});
@@ -917,6 +917,45 @@ check("после удаления «следующий шаг» пустой", 
 check("после удаления ветка «нет» пустая", R[0].otherwise === "");
 check("после удаления вариант рандома пустой", R[0].options[0].next === "");
 check("стартовым стал оставшийся блок", api.getS().start === "a");
+
+/* --- занятый выход закрашен, свободный пустой --- */
+api.setS({start: "a", steps: [
+  {id: "a", type: "message", name: "", text: "", buttons: [], next: "b", x: 0, y: 0},
+  {id: "b", type: "message", name: "", text: "", buttons: [], next: "", x: 0, y: 0},
+  {id: "c", type: "message", name: "", text: "", buttons: [], next: "нет такого", x: 0, y: 0},
+]});
+function dotsOf(id) {
+  const found = [];
+  (function walk(item) {
+    if (!item || !item.children) return;
+    item.children.forEach(function (kid) {
+      if (typeof kid.className === "string" && kid.className.indexOf("dot ") === 0) {
+        found.push(kid.className);
+      }
+      walk(kid);
+    });
+  })(api.nodeEl(api.byId(id)));
+  return found;
+}
+check("выход со стрелкой закрашен",
+      dotsOf("a").some((c) => c.indexOf("wired") >= 0), dotsOf("a").join(" | "));
+check("свободный выход не закрашен",
+      !dotsOf("b").some((c) => c.indexOf("wired") >= 0), dotsOf("b").join(" | "));
+check("стрелка в никуда выход не закрашивает",
+      !dotsOf("c").some((c) => c.indexOf("wired") >= 0), dotsOf("c").join(" | "));
+
+/* --- линия входит в блок снизу, а не в середину --- */
+const tallNode = {offsetHeight: 200, querySelectorAll: () => []};
+check("без полосок линия входит у нижнего края",
+      api.inletY(tallNode) === 182, String(api.inletY(tallNode)));
+const withPorts = {
+  offsetHeight: 200,
+  querySelectorAll: () => [{offsetTop: 100, offsetHeight: 20},
+                           {offsetTop: 140, offsetHeight: 20}],
+};
+check("линия входит вровень с нижней полоской",
+      api.inletY(withPorts) === 150, String(api.inletY(withPorts)));
+check("вход не по середине блока", api.inletY(withPorts) !== 100);
 
 /* --- заготовки новых блоков знают про новые поля --- */
 const blankMsg = api.blankStep("message");
