@@ -829,6 +829,7 @@ const api = new Function(
   "  nextId, byId, titleOf, META, ORDER," +
   "  cleanName, isNumberVar, varItems, tagItems, shotSrc, nodeEl, inletY," +
   "  armCut, cutLink, dropCut, getCUT: () => CUT," +
+  "  wireAt, setWIRES: (v) => { WIRES = v; }," +
   "  ACTION_NAMES, SET_OPS, OP_NAMES" +
   "};"
 )(window, document, location, sessionStorage, fetch, () => 0, () => {});
@@ -944,6 +945,28 @@ check("свободный выход не закрашен",
       !dotsOf("b").some((c) => c.indexOf("wired") >= 0), dotsOf("b").join(" | "));
 check("стрелка в никуда выход не закрашивает",
       !dotsOf("c").some((c) => c.indexOf("wired") >= 0), dotsOf("c").join(" | "));
+
+/* --- по какой линии нажали --- */
+api.setWIRES([
+  {id: "a", out: 0, x1: 0, y1: 100, x2: 300, y2: 100},
+  {id: "b", out: 2, x1: 0, y1: 400, x2: 300, y2: 400},
+]);
+check("нажатие прямо по линии её находит",
+      (api.wireAt({x: 150, y: 100}, 18) || {}).id === "a",
+      JSON.stringify(api.wireAt({x: 150, y: 100}, 18)));
+check("нажатие чуть в стороне тоже засчитывается",
+      (api.wireAt({x: 150, y: 112}, 18) || {}).id === "a");
+check("нажатие далеко от линий ничего не находит",
+      api.wireAt({x: 150, y: 250}, 18) === null,
+      JSON.stringify(api.wireAt({x: 150, y: 250}, 18)));
+check("из двух линий выбирается ближняя",
+      (api.wireAt({x: 150, y: 380}, 30) || {}).id === "b");
+check("найденная линия помнит свой выход",
+      (api.wireAt({x: 150, y: 400}, 18) || {}).out === 2);
+check("мимо начала и конца линия не считается задетой",
+      api.wireAt({x: -60, y: 100}, 18) === null);
+api.setWIRES([]);
+check("без стрелок нажимать не на что", api.wireAt({x: 0, y: 0}, 18) === null);
 
 /* --- нажатие по линии и корзина --- */
 api.setS({start: "a", steps: [

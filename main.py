@@ -2299,10 +2299,6 @@ button{cursor:pointer}
 .wire.no{stroke:#e2483d}
 /* Вход в блок — такой же полый кружок, как и выход из него. */
 .wire-end{fill:#fff;stroke:#9db4c9;stroke-width:2}
-/* Невидимая полоса поверх линии: попасть пальцем в тонкую линию нельзя,
-   а в такую — легко. Она и ловит касание. */
-.wire-hit{fill:none;stroke:transparent;stroke-width:18;pointer-events:stroke;
-          cursor:pointer}
 .cut{position:absolute;width:34px;height:34px;border:none;border-radius:10px;
      background:#fff;color:var(--danger);font-size:18px;font-weight:800;
      -webkit-text-stroke:.7px currentColor;transform-origin:50% 100%;
@@ -2780,6 +2776,7 @@ function cleanName(text) {
 var SEL = "";             /* какой блок выбран */
 var LINKING = null;       /* {id, out} — от какого кружка тянем стрелку */
 var CUT = null;           /* {id, out, x, y} — по какой линии нажали */
+var WIRES = [];           /* где сейчас проходят стрелки */
 var PAN = {x: 40, y: 90, z: 1, ready: false};
 var NODES = {};
 var DIRTY = false;
@@ -2940,14 +2937,55 @@ function zoomBy(factor) {
   applyPan();
 }
 
-function wirePath(x1, y1, x2, y2, tone, kind) {
-  var bend = Math.max(40, Math.abs(x2 - x1) / 2);
+function bendOf(x1, x2) {
+  return Math.max(40, Math.abs(x2 - x1) / 2);
+}
+
+function wirePath(x1, y1, x2, y2, tone) {
+  var bend = bendOf(x1, x2);
   var path = document.createElementNS(SVGNS, "path");
-  path.setAttribute("class", kind || ("wire " + (tone || "")));
+  path.setAttribute("class", "wire " + (tone || ""));
   path.setAttribute("d", "M " + x1 + " " + y1 +
     " C " + (x1 + bend) + " " + y1 + ", " + (x2 - bend) + " " + y2 +
     ", " + x2 + " " + y2);
   return path;
+}
+
+/* Насколько далеко точка от отрезка. */
+function gapToPiece(point, from, to) {
+  var dx = to.x - from.x, dy = to.y - from.y;
+  var len = dx * dx + dy * dy;
+  var along = len ? ((point.x - from.x) * dx + (point.y - from.y) * dy) / len : 0;
+  along = Math.max(0, Math.min(1, along));
+  return Math.hypot(point.x - (from.x + along * dx),
+                    point.y - (from.y + along * dy));
+}
+
+/* По какой стрелке нажали.
+   Спрашивать об этом сам рисунок нельзя: полотно на нажатии забирает
+   указатель себе, и до отпускания браузер сообщает не линию, а полотно.
+   Поэтому считаем сами — где проходит кривая и далеко ли от неё нажали. */
+function wireAt(point, reach) {
+  var closest = null, best = reach;
+  WIRES.forEach(function (wire) {
+    var bend = bendOf(wire.x1, wire.x2);
+    var was = null;
+    for (var i = 0; i <= 24; i++) {
+      var t = i / 24, u = 1 - t;
+      var spot = {
+        x: u * u * u * wire.x1 + 3 * u * u * t * (wire.x1 + bend) +
+           3 * u * t * t * (wire.x2 - bend) + t * t * t * wire.x2,
+        y: u * u * u * wire.y1 + 3 * u * u * t * wire.y1 +
+           3 * u * t * t * wire.y2 + t * t * t * wire.y2,
+      };
+      if (was) {
+        var gap = gapToPiece(point, was, spot);
+        if (gap < best) { best = gap; closest = wire; }
+      }
+      was = spot;
+    }
+  });
+  return closest;
 }
 
 /* Куда линия входит в блок: не в середину левого края, а на той же высоте,
@@ -2966,6 +3004,7 @@ function drawWires() {
   var svg = document.getElementById("wires");
   if (!svg) return;
   svg.textContent = "";
+  WIRES = [];
   S.steps.forEach(function (step) {
     var from = NODES[step.id];
     if (!from) return;
@@ -2980,12 +3019,7 @@ function drawWires() {
       var x2 = target.x;
       var y2 = target.y + inletY(to);
       svg.append(wirePath(x1, y1, x2, y2, out.tone));
-
-      // Широкая прозрачная полоса поверх линии — по ней и попадают пальцем.
-      var hit = wirePath(x1, y1, x2, y2, "", "wire-hit");
-      hit.setAttribute("data-from", step.id);
-      hit.setAttribute("data-out", index);
-      svg.append(hit);
+      WIRES.push({id: step.id, out: index, x1: x1, y1: y1, x2: x2, y2: y2});
 
       var end = document.createElementNS(SVGNS, "circle");
       end.setAttribute("class", "wire-end");
@@ -3310,13 +3344,16 @@ function attachCanvas() {
             y: (e.clientY - box.top - PAN.y) / PAN.z};
   }
 
-  function onNode(e) {
-    return !!(e.target && e.target.closest && e.target.closest(".node"));
+  /* Куда именно нажали. Спрашивать об этом у события отпускания нельзя:
+     полотно на нажатии забирает указатель себе, и потом браузер сообщает
+     полотно, а не то, по чему попали. Поэтому запоминаем при нажатии. */
+  function onNode(target) {
+    return !!(target && target.closest && target.closest(".node"));
   }
 
   canvas.addEventListener("contextmenu", function (e) {
     e.preventDefault();
-    if (!onNode(e)) openPalette(worldAt(e));
+    if (!onNode(e.target)) openPalette(worldAt(e));
   });
 
   function ids() { return Object.keys(points); }
@@ -3328,7 +3365,8 @@ function attachCanvas() {
     points[e.pointerId] = {x: e.clientX, y: e.clientY};
     var list = ids();
     if (list.length === 1) {
-      pan = {x: e.clientX, y: e.clientY, px: PAN.x, py: PAN.y, moved: false};
+      pan = {x: e.clientX, y: e.clientY, px: PAN.x, py: PAN.y, moved: false,
+             target: e.target};
       try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
     } else if (list.length === 2) {
       dropCut();
@@ -3368,18 +3406,18 @@ function attachCanvas() {
     delete points[e.pointerId];
     if (ids().length < 2) pinch = null;
 
-    // Попали по линии — предлагаем её убрать, полотно при этом не трогаем.
-    var target = e.target || {};
-    var from = target.getAttribute ? target.getAttribute("data-from") : null;
-    if (pan && !pan.moved && from) {
-      pan = null;
-      tap = null;
-      armCut(from, +target.getAttribute("data-out"), worldAt(e));
-      if (!ids().length) pan = null;
-      return;
-    }
+    if (pan && !pan.moved && !onNode(pan.target)) {
+      var spot = worldAt(e);
+      // Нажали по стрелке — предлагаем её убрать.
+      var wire = wireAt(spot, 18 / PAN.z);
+      if (wire) {
+        pan = null;
+        tap = null;
+        armCut(wire.id, wire.out, spot);
+        if (!ids().length) pan = null;
+        return;
+      }
 
-    if (pan && !pan.moved && !onNode(e)) {
       dropCut();
       var now = new Date().getTime();
       var again = tap && now - tap.at < 340 &&
