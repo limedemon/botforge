@@ -203,7 +203,10 @@ DEFAULT_SCENARIO: Dict[str, Any] = {
 DDL_PG = """
 CREATE TABLE IF NOT EXISTS projects (
     id           BIGSERIAL PRIMARY KEY,
-    owner_id     BIGINT UNIQUE NOT NULL,
+    owner_id     BIGINT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    avatar       TEXT NOT NULL DEFAULT '',
     bot_token    TEXT NOT NULL DEFAULT '',
     bot_username TEXT NOT NULL DEFAULT '',
     scenario     TEXT NOT NULL,
@@ -211,6 +214,11 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at   DOUBLE PRECISION NOT NULL,
     updated_at   DOUBLE PRECISION NOT NULL
 );
+ALTER TABLE projects DROP CONSTRAINT IF EXISTS projects_owner_id_key;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS projects_owner ON projects (owner_id, created_at);
 CREATE TABLE IF NOT EXISTS sessions (
     project_id BIGINT NOT NULL,
     chat_id    BIGINT NOT NULL,
@@ -262,7 +270,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS tags_name ON tags (project_id, name);
 DDL_SQLITE = """
 CREATE TABLE IF NOT EXISTS projects (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id     INTEGER UNIQUE NOT NULL,
+    owner_id     INTEGER NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    avatar       TEXT NOT NULL DEFAULT '',
     bot_token    TEXT NOT NULL DEFAULT '',
     bot_username TEXT NOT NULL DEFAULT '',
     scenario     TEXT NOT NULL,
@@ -270,6 +281,7 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS projects_owner ON projects (owner_id, created_at);
 CREATE TABLE IF NOT EXISTS sessions (
     project_id INTEGER NOT NULL,
     chat_id    INTEGER NOT NULL,
@@ -468,17 +480,26 @@ db = Db()
 
 
 async def get_or_create_project(owner_id: int) -> dict:
-    row = await db.fetchrow("SELECT * FROM projects WHERE owner_id = $1", owner_id)
+    row = await db.fetchrow(
+        "SELECT * FROM projects WHERE owner_id = $1 ORDER BY created_at LIMIT 1", owner_id)
     if row:
         return row
+    return await create_project(owner_id, "Проект 1", "")
+
+
+async def create_project(owner_id: int, name: str, description: str) -> dict:
     now = time.time()
     await db.execute(
-        "INSERT INTO projects (owner_id, scenario, hook_secret, created_at, updated_at)"
-        " VALUES ($1, $2, $3, $4, $5) ON CONFLICT (owner_id) DO NOTHING",
-        owner_id, json.dumps(DEFAULT_SCENARIO, ensure_ascii=False),
+        "INSERT INTO projects (owner_id, name, description, scenario, hook_secret,"
+        " created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        owner_id, (name or "Новый проект")[:60], (description or "")[:200],
+        json.dumps(DEFAULT_SCENARIO, ensure_ascii=False),
         secrets.token_urlsafe(24), now, now,
     )
-    return await db.fetchrow("SELECT * FROM projects WHERE owner_id = $1", owner_id)
+    return await db.fetchrow(
+        "SELECT * FROM projects WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 1",
+        owner_id,
+    )
 
 
 async def get_project(project_id: int) -> Optional[dict]:
@@ -1674,7 +1695,17 @@ def check_init_data(init_data: str) -> dict:
 
 async def current_project(request: web.Request) -> tuple:
     user = check_init_data(request.headers.get("X-Init-Data", ""))
-    project = await get_or_create_project(int(user["id"]))
+    pid = request.headers.get("X-Project-Id", "").strip()
+    project = None
+    if pid:
+        try:
+            project = await get_project(int(pid))
+        except ValueError:
+            project = None
+        if project and int(project["owner_id"]) != int(user["id"]):
+            raise web.HTTPForbidden(text="Чужой проект")
+    if not project:
+        project = await get_or_create_project(int(user["id"]))
     return project, user
 
 
@@ -1764,7 +1795,8 @@ async def api_connect(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(
             text="Telegram не принял токен: " + str(me.get("description", "ошибка"))
         )
-    username = (me.get("result") or {}).get("username", "")
+    me_result = me.get("result") or {}
+    username = me_result.get("username", "")
 
     info = await tg(token, "getWebhookInfo")
     previous = ((info.get("result") or {}).get("url") or "")
@@ -1780,10 +1812,25 @@ async def api_connect(request: web.Request) -> web.Response:
             text="Не удалось подключить: " + str(result.get("description"))
         )
 
+    avatar = project["avatar"]
+    photos = await tg(token, "getUserProfilePhotos", user_id=me_result.get("id"), limit=1)
+    photos_result = photos.get("result")
+    sizes = (photos_result.get("photos") if isinstance(photos_result, dict) else None) or []
+    sizes = sizes[0] if sizes else []
+    if sizes:
+        blob = await tg_download(token, sizes[0]["file_id"])
+        if blob:
+            avatar = await save_asset(int(project["owner_id"]), blob, "image/jpeg")
+
+    # Токен сменился — значит за проектом теперь другой бот, старые открытия не в счёт.
+    if project["bot_token"] and project["bot_token"] != token:
+        await db.execute("DELETE FROM sessions WHERE project_id = $1", project["id"])
+        await db.execute("DELETE FROM timers WHERE project_id = $1", project["id"])
+
     await db.execute(
-        "UPDATE projects SET bot_token = $1, bot_username = $2, updated_at = $3"
-        " WHERE id = $4",
-        token, username, time.time(), project["id"],
+        "UPDATE projects SET bot_token = $1, bot_username = $2, avatar = $3,"
+        " updated_at = $4 WHERE id = $5",
+        token, username, avatar, time.time(), project["id"],
     )
     return web.json_response({"ok": True, "bot_username": username, "warning": warning})
 
@@ -1798,6 +1845,65 @@ async def api_disconnect(request: web.Request) -> web.Response:
         " WHERE id = $2",
         time.time(), project["id"],
     )
+    return web.json_response({"ok": True})
+
+
+async def api_projects(request: web.Request) -> web.Response:
+    user = check_init_data(request.headers.get("X-Init-Data", ""))
+    await get_or_create_project(int(user["id"]))          # первый проект есть всегда
+    rows = await db.fetch(
+        "SELECT p.*, (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS people"
+        " FROM projects p WHERE p.owner_id = $1 ORDER BY p.created_at",
+        int(user["id"]),
+    )
+    return web.json_response({"projects": [
+        {"id": r["id"], "name": r["name"], "description": r["description"],
+         "bot_username": r["bot_username"], "connected": bool(r["bot_token"]),
+         "avatar": r["avatar"], "people": r["people"]}
+        for r in rows
+    ]})
+
+
+async def api_project_create(request: web.Request) -> web.Response:
+    user = check_init_data(request.headers.get("X-Init-Data", ""))
+    body = await request.json()
+    project = await create_project(
+        int(user["id"]),
+        str(body.get("name", "")).strip(),
+        str(body.get("description", "")).strip(),
+    )
+    return web.json_response({"ok": True, "id": project["id"]})
+
+
+def _own_project(project: Optional[dict], user: dict) -> dict:
+    if not project or int(project["owner_id"]) != int(user["id"]):
+        raise web.HTTPForbidden(text="Чужой проект")
+    return project
+
+
+async def api_project_update(request: web.Request) -> web.Response:
+    user = check_init_data(request.headers.get("X-Init-Data", ""))
+    body = await request.json()
+    project = _own_project(await get_project(int(body.get("project_id", 0))), user)
+    name = str(body.get("name", "")).strip() or project["name"]
+    description = str(body.get("description", "")).strip()
+    await db.execute(
+        "UPDATE projects SET name = $1, description = $2, updated_at = $3 WHERE id = $4",
+        name[:60], description[:200], time.time(), project["id"],
+    )
+    return web.json_response({"ok": True})
+
+
+async def api_project_delete(request: web.Request) -> web.Response:
+    user = check_init_data(request.headers.get("X-Init-Data", ""))
+    body = await request.json()
+    project = _own_project(await get_project(int(body.get("project_id", 0))), user)
+    if project["bot_token"]:
+        await tg(project["bot_token"], "deleteWebhook", drop_pending_updates=True)
+    pid = project["id"]
+    for table in ("sessions", "timers", "variables", "tags"):
+        await db.execute(f"DELETE FROM {table} WHERE project_id = $1", pid)
+    await db.execute("DELETE FROM projects WHERE id = $1", pid)
     return web.json_response({"ok": True})
 
 
@@ -2221,6 +2327,10 @@ def build_app() -> web.Application:
     app.router.add_post("/api/scenario", api_save)
     app.router.add_post("/api/bot/connect", api_connect)
     app.router.add_post("/api/bot/disconnect", api_disconnect)
+    app.router.add_get("/api/projects", api_projects)
+    app.router.add_post("/api/projects/create", api_project_create)
+    app.router.add_post("/api/projects/update", api_project_update)
+    app.router.add_post("/api/projects/delete", api_project_delete)
     app.router.add_get("/api/assets", api_assets)
     app.router.add_post("/api/assets/delete", api_asset_delete)
     app.router.add_get("/api/vars", api_vars)
@@ -2467,6 +2577,26 @@ textarea.inp{min-height:78px;resize:vertical}
          background:#f2f5f8}
 .preview img{display:block;width:100%;max-height:190px;object-fit:contain}
 
+/* ---------- карточки проектов ---------- */
+.projects{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
+          gap:10px;margin-top:10px}
+.pcard{display:flex;flex-direction:column;gap:5px;padding:10px;border:1px solid var(--line);
+       border-radius:16px;background:#fff}
+.pcard .ava{width:100%;aspect-ratio:1/1;border-radius:12px;background:#f2f5f8;
+            object-fit:cover;display:block}
+.pcard .ava.ph{display:flex;align-items:center;justify-content:center;font-size:26px;
+               color:#9aa4b2;background:#f2f5f8}
+.pcard b{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcard small{color:#7c8698;font-size:11px;display:-webkit-box;-webkit-line-clamp:2;
+             -webkit-box-orient:vertical;overflow:hidden}
+.pcard .cnt{font-size:11px;color:#9aa4b2}
+.pcard .btns{display:flex;gap:6px;margin-top:auto;padding-top:4px}
+.pcard .btns button{flex:1;font-size:11px;padding:7px 0;border:none;border-radius:9px;
+                     background:#f0f3f7}
+.pcard .btns button.kill{color:var(--danger)}
+.pcard.add{align-items:center;justify-content:center;min-height:150px;background:#f8fafc;
+           border-style:dashed;color:var(--accent);font-size:13px;font-weight:600}
+
 /* ---------- выпадающий выбор с поиском ---------- */
 .combo{position:relative}
 .combo-list{position:absolute;left:0;right:0;top:100%;z-index:9;max-height:200px;
@@ -2496,7 +2626,22 @@ textarea.inp{min-height:78px;resize:vertical}
       color:#12608e;font-size:11px;margin:2px 4px 2px 0}
 .pill.project{background:#efe6fd;color:#6a2ea0}
 .pill.tag{background:#eceff3;color:#41556b}
+.inp.chip{background:#e8f0fb;color:#12608e;border-color:transparent;font-weight:600}
+.inp.chip.project{background:#efe6fd;color:#6a2ea0}
+.inp.chip.tag{background:#eceff3;color:#41556b}
 .empty{padding:18px 4px;text-align:center;font-size:13px;color:var(--soft)}
+
+/* ---------- текст с чипами переменных ---------- */
+.inp.rich{position:relative;min-height:78px;white-space:pre-wrap;word-break:break-word;
+          outline:none}
+.inp.rich.one{min-height:0;white-space:nowrap;overflow-x:auto}
+.inp.rich:empty:before{content:attr(data-ph);color:var(--soft)}
+.vchip{display:inline;padding:2px 5px;border-radius:8px;background:#e8f0fb;color:#12608e;
+       font-weight:600;white-space:nowrap;unicode-bidi:isolate}
+.vchip.project{background:#efe6fd;color:#6a2ea0}
+.vchip.unk{background:#eceff3;color:#41556b}
+.vchip .br{font-size:0}
+.rich-menu{width:220px;right:auto}
 
 @media (max-width:700px){
   /* Кнопок наверху много, а места мало — ужимаем их и подпись бота. */
@@ -2553,6 +2698,13 @@ try {
   else INIT = sessionStorage.getItem("tgInitData") || "";
 } catch (e) {}
 
+var PROJECT_ID = "";
+try { PROJECT_ID = localStorage.getItem("botforge_project") || ""; } catch (e) {}
+function setProjectId(id) {
+  PROJECT_ID = String(id || "");
+  try { localStorage.setItem("botforge_project", PROJECT_ID); } catch (e) {}
+}
+
 function postEvent(type, data) {
   data = data || {};
   var json = JSON.stringify(data);
@@ -2602,6 +2754,16 @@ function combo(value, placeholder, items, onpick) {
   var list = null;
   var field = el("input", {class: "inp", value: value || "",
                            placeholder: placeholder || ""});
+  var committed = !!(value && value.trim());
+  var tone = "";
+
+  function paintPill() {
+    var found = committed
+      ? items().filter(function (it) { return it.name === field.value; })[0] : null;
+    tone = found ? (found.tone || "") : tone;
+    field.className = "inp" + (committed ? " chip " + tone : "");
+  }
+  paintPill();
 
   function close() {
     if (list) { list.remove(); list = null; }
@@ -2621,6 +2783,8 @@ function combo(value, placeholder, items, onpick) {
       list.append(el("button", {onpointerdown: function (e) {
         e.preventDefault();               /* иначе поле потеряет фокус раньше */
         field.value = item.name;
+        committed = true;
+        paintPill();
         close();
         onpick(item.name);
       }},
@@ -2632,13 +2796,28 @@ function combo(value, placeholder, items, onpick) {
   }
 
   field.addEventListener("focus", open);
+  field.addEventListener("keydown", function (e) {
+    if (e.key === "Backspace" && committed &&
+        field.selectionStart === field.selectionEnd) {
+      e.preventDefault();
+      field.value = "";
+      committed = false;
+      paintPill();
+      onpick("");
+      open();
+    }
+  });
   field.addEventListener("input", function () {
+    committed = false;
     field.value = cleanChars(field.value);
+    paintPill();
     open();
     onpick(field.value);
   });
   field.addEventListener("blur", function () {
     field.value = cleanName(field.value);       /* набрали — привели в порядок */
+    committed = !!field.value;
+    paintPill();
     onpick(field.value);
     setTimeout(close, 150);
   });
@@ -2657,19 +2836,164 @@ function tagItems() {
   return TAGS.map(function (name) { return {name: name, kind: "", tone: "tag"}; });
 }
 
-/* Кнопка «{ }» рядом с текстом: вставляет переменную прямо туда, где курсор. */
-function insertVarButton(field, onchange) {
-  return el("button", {class: "mini", title: "Вставить переменную",
-                       onclick: function () {
-    chooseFrom("Вставить переменную", varItems, function (name) {
-      var text = field.value || "";
-      var from = field.selectionStart, to = field.selectionEnd;
-      if (typeof from !== "number") { from = to = text.length; }
-      field.value = text.slice(0, from) + "{" + name + "}" + text.slice(to);
-      onchange(field.value);
-      try { field.focus(); } catch (e) {}
+/* Переменная {имя} в тексте — цветная таблетка, а не голые скобки. Синяя —
+   пользовательская, фиолетовая — проектная, серая — переменной уже нет.
+   Скобки остаются в DOM (копипаст и сохранение работают с обычным «{имя}»),
+   просто визуально спрятаны через нулевой размер шрифта. */
+var VCHIP_RE = /\{([\w ]{1,40})\}/g;
+
+function chipTone(name) {
+  var found = VARS.filter(function (v) { return v.name === name; })[0];
+  if (!found) return "unk";
+  return found.scope === "project" ? "project" : "";
+}
+
+function makeChip(name) {
+  var chip = el("span", {class: "vchip " + chipTone(name), contenteditable: "false",
+                         "data-name": name});
+  chip.append(el("span", {class: "br"}, "{"), document.createTextNode(name),
+              el("span", {class: "br"}, "}"));
+  return chip;
+}
+
+function fillRich(box, text) {
+  box.textContent = "";
+  var re = new RegExp(VCHIP_RE.source, "g"), last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) box.append(document.createTextNode(text.slice(last, m.index)));
+    box.append(makeChip(m[1]));
+    last = re.lastIndex;
+  }
+  if (last < text.length || !box.childNodes.length) {
+    box.append(document.createTextNode(text.slice(last)));
+  }
+}
+
+function serializeRich(box) {
+  var out = "";
+  box.childNodes.forEach(function (node) {
+    out += (node.nodeType === 1 && node.hasAttribute("data-name"))
+      ? "{" + node.getAttribute("data-name") + "}" : node.textContent;
+  });
+  return out;
+}
+
+/* Текстовое поле с чипами переменных вместо textarea/input. По вводу «"»
+   всплывает список переменных под курсором; выбор вставляет чип, который
+   удаляется одним Backspace и копируется как единое целое. */
+function richText(value, placeholder, onchange, multiline) {
+  var box = el("div", {class: "inp rich" + (multiline ? "" : " one"),
+                       contenteditable: "true", "data-ph": placeholder || ""});
+  fillRich(box, value || "");
+
+  var menu = null;
+
+  function closeMenu() {
+    if (menu) { menu.remove(); menu = null; }
+  }
+
+  function caretQuote() {
+    var sel = window.getSelection();
+    if (!sel.rangeCount) return null;
+    var range = sel.getRangeAt(0);
+    if (!range.collapsed || range.startContainer.nodeType !== 3) return null;
+    var text = range.startContainer.textContent.slice(0, range.startOffset);
+    var at = text.lastIndexOf('"');
+    if (at < 0) return null;
+    var filter = text.slice(at + 1);
+    if (filter.indexOf('"') >= 0) return null;
+    return {node: range.startContainer, quoteAt: at, endOffset: range.startOffset,
+            filter: filter, range: range};
+  }
+
+  function insertChip(info, name) {
+    var node = info.node;
+    var before = node.textContent.slice(0, info.quoteAt);
+    var after = node.textContent.slice(info.endOffset);
+    var chip = makeChip(name);
+    var afterNode = document.createTextNode(after);
+    node.textContent = before;
+    node.parentNode.insertBefore(chip, node.nextSibling);
+    node.parentNode.insertBefore(afterNode, chip.nextSibling);
+    var sel = window.getSelection();
+    var r = document.createRange();
+    r.setStart(afterNode, 0);
+    r.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r);
+    closeMenu();
+    emit();
+  }
+
+  function openMenuAt(info) {
+    closeMenu();
+    var wanted = info.filter.trim().toLowerCase();
+    var shown = VARS.filter(function (v) { return !v.archived; }).filter(function (v) {
+      return !wanted || v.name.toLowerCase().indexOf(wanted) >= 0;
+    }).slice(0, 40);
+    menu = el("div", {class: "combo-list rich-menu"});
+    if (!shown.length) {
+      menu.append(el("div", {class: "empty"}, "Нет подходящих переменных."));
+    }
+    shown.forEach(function (v) {
+      menu.append(el("button", {onpointerdown: function (e) {
+        e.preventDefault();
+        insertChip(info, v.name);
+      }}, el("span", {class: "pin " + (v.scope === "project" ? "project" : "")}),
+        el("span", {}, v.name)));
     });
-  }}, "{ }");
+    var rect = info.range.getBoundingClientRect();
+    var host = box.getBoundingClientRect();
+    menu.style.left = Math.max(0, rect.left - host.left) + "px";
+    menu.style.top = (rect.bottom - host.top + 4) + "px";
+    box.append(menu);
+  }
+
+  function emit() { onchange(serializeRich(box)); }
+
+  box.addEventListener("input", function () {
+    var info = caretQuote();
+    if (info) openMenuAt(info); else closeMenu();
+    emit();
+  });
+
+  box.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (!multiline) return;
+      var sel = window.getSelection();
+      if (sel.rangeCount) {
+        var range = sel.getRangeAt(0);
+        range.deleteContents();
+        var nl = document.createTextNode("\n");
+        range.insertNode(nl);
+        range.setStartAfter(nl);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      closeMenu();
+      emit();
+      return;
+    }
+    if (e.key === "Escape") { closeMenu(); return; }
+    if (e.key !== "Backspace") return;
+    var sel = window.getSelection();
+    if (!sel.rangeCount) return;
+    var range = sel.getRangeAt(0);
+    if (!range.collapsed) return;
+    var node = range.startContainer, offset = range.startOffset, prev = null;
+    if (node.nodeType === 3 && offset === 0) prev = node.previousSibling;
+    else if (node === box && offset > 0) prev = box.childNodes[offset - 1];
+    if (prev && prev.nodeType === 1 && prev.hasAttribute("data-name")) {
+      e.preventDefault();
+      prev.remove();
+      emit();
+    }
+  });
+
+  box.addEventListener("blur", closeMenu);
+  return box;
 }
 
 /* Кнопка, которую надо нажать дважды: системные диалоги в мини-аппах
@@ -2691,7 +3015,8 @@ function armed(button, warning, action) {
 
 async function api(path, options) {
   options = options || {};
-  options.headers = {"X-Init-Data": INIT, "Content-Type": "application/json"};
+  options.headers = {"X-Init-Data": INIT, "X-Project-Id": PROJECT_ID,
+                     "Content-Type": "application/json"};
   var response = await fetch(path, options);
   var data = {};
   try { data = await response.json(); } catch (e) {}
@@ -3544,15 +3869,13 @@ function renderPanel() {
                     "Точно удалить?", function () { removeStep(step.id); }));
 }
 
-/* Строка «текстовое поле + кнопка вставки переменной». */
+/* Текстовое поле сообщения: чипы переменных, набор «"» открывает подсказку. */
 function textWithVars(value, placeholder, onchange) {
-  var field = area(value, placeholder, function (e) { onchange(e.target.value); });
   var box = el("div", {});
-  box.append(field);
-  box.append(el("div", {class: "row", style: "margin-top:6px"},
-    insertVarButton(field, onchange),
-    el("div", {class: "note", style: "margin:0;flex:1"},
-      "Кнопка { } вставит переменную. Оформление: <b>жирный</b>, <i>курсив</i>, <code>код</code>.")));
+  box.append(richText(value, placeholder, onchange, true));
+  box.append(el("div", {class: "note", style: "margin-top:6px"},
+    "Наберите «\"» — появится список переменных. Оформление: <b>жирный</b>, " +
+    "<i>курсив</i>, <code>код</code>."));
   return box;
 }
 
@@ -3776,10 +4099,10 @@ function fieldsAction(body, step) {
       /* Знаки «+ − × ÷» имеют смысл только у числовой переменной. Панель при
          этом не перерисовываем — иначе поле теряло бы курсор во время набора,
          поэтому просто включаем и выключаем нужное. */
-      var value = line(action.value, "значение", function (e) {
-        action.value = e.target.value;
+      var value = richText(action.value, "значение", function (text) {
+        action.value = text;
         refresh(step);
-      });
+      }, false);
       var signs = pick(SET_OPS, action.op || "set", function (e) {
         action.op = e.target.value;
         refresh(step);
@@ -3797,8 +4120,8 @@ function fieldsAction(body, step) {
           action.op = "set";
           signs.value = "set";
         }
-        value.placeholder = numeric ? "число или {переменная} + 1"
-                                    : "значение, можно с {переменными}";
+        value.setAttribute("data-ph", numeric ? "число или \"переменная\" + 1"
+                                              : "значение, можно с переменными");
         hint.hidden = numeric || !action.name;
       }
 
@@ -3808,12 +4131,7 @@ function fieldsAction(body, step) {
           syncSigns();
           refresh(step);
         })));
-      group.append(el("div", {class: "row", style: "margin-top:6px"}, signs, value,
-        insertVarButton(value, function (text) {
-          action.value = text;
-          value.value = text;
-          refresh(step);
-        })));
+      group.append(el("div", {class: "row", style: "margin-top:6px"}, signs, value));
       group.append(hint);
       syncSigns();
     }
@@ -3827,17 +4145,12 @@ function fieldsAction(body, step) {
     }
 
     if (action.kind === "notify") {
-      var note = line(action.value, "текст уведомления, пусто — все ответы",
-        function (e) {
-          action.value = e.target.value;
-          refresh(step);
-        });
-      group.append(el("div", {class: "row", style: "margin-top:6px"}, note,
-        insertVarButton(note, function (text) {
+      var note = richText(action.value, "текст уведомления, пусто — все ответы",
+        function (text) {
           action.value = text;
-          note.value = text;
           refresh(step);
-        })));
+        }, false);
+      group.append(el("div", {class: "row", style: "margin-top:6px"}, note));
       group.append(el("div", {class: "note"},
         "Придёт вам в переписку с ботом-конструктором."));
     }
@@ -4046,33 +4359,13 @@ function openPalette(at) {
   popup(sheet);
 }
 
-/* Небольшое окно со списком: выбрать переменную, тег, картинку. */
-function chooseFrom(title, itemsFn, onpick) {
-  var sheet = el("div", {class: "sheet", id: "sheet"});
-  sheet.append(el("h3", {}, title));
-  var items = itemsFn();
-  if (!items.length) {
-    sheet.append(el("div", {class: "empty"}, "Пока пусто."));
-  }
-  var rows = el("div", {class: "combo-list", style: "position:static;box-shadow:none;max-height:56vh"});
-  items.forEach(function (item) {
-    rows.append(el("button", {onclick: function () {
-      closePopups();
-      onpick(item.name);
-    }},
-      el("span", {class: "pin " + (item.tone || "")}),
-      el("span", {}, item.name),
-      item.kind ? el("span", {class: "kind"}, item.kind) : null));
-  });
-  sheet.append(rows);
-  popup(sheet);
-}
-
 function openMenu() {
   var menu = el("div", {class: "menu", id: "menu"});
   menu.append(el("button", {onclick: function () { closePopups(); save(); }}, "Сохранить"));
   menu.append(el("button", {onclick: function () { closePopups(); autoLayout(); touch(); renderCanvas(); fitView(); }},
     "Разложить блоки"));
+  menu.append(el("button", {onclick: function () { closePopups(); openProjects(); }},
+    "Мои проекты"));
   menu.append(el("hr"));
   menu.append(el("button", {onclick: function () { closePopups(); openVars(); }},
     "Переменные"));
@@ -4085,6 +4378,104 @@ function openMenu() {
     menu.append(el("button", {onclick: function () { closePopups(); openBot(); }}, "Открыть бота"));
   }
   popup(menu);
+}
+
+async function openProjects() {
+  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  var grid = el("div", {class: "projects"}, el("div", {class: "empty"}, "Загружаю…"));
+  sheet.append(el("h3", {}, "Мои проекты"), grid);
+  popup(sheet);
+
+  var projects = [];
+  try {
+    projects = (await api("/api/projects")).projects || [];
+  } catch (e) {
+    flash(e.message, "long");
+  }
+  grid.textContent = "";
+  projects.forEach(function (p) { grid.append(projectCard(p)); });
+  grid.append(el("button", {class: "pcard add", onclick: function () {
+    closePopups();
+    openProjectForm(null);
+  }}, "+ Создать проект"));
+}
+
+function projectCard(p) {
+  var ava = p.avatar
+    ? el("img", {class: "ava", src: "/img/" + p.avatar})
+    : el("div", {class: "ava ph"}, (p.bot_username || p.name || "?").slice(0, 1).toUpperCase());
+  var btns = el("div", {class: "btns"},
+    el("button", {onclick: function (e) {
+      e.stopPropagation();
+      closePopups();
+      openProjectForm(p);
+    }}, "Изменить"),
+    armed(el("button", {class: "kill"}, "Удалить"), "Точно?", async function () {
+      try {
+        await api("/api/projects/delete",
+          {method: "POST", body: JSON.stringify({project_id: p.id})});
+        if (String(p.id) === PROJECT_ID) {
+          setProjectId("");
+          await loadState();
+          repaint();
+        }
+        openProjects();
+      } catch (e) { flash(e.message, "long"); }
+    }));
+  var card = el("div", {class: "pcard"},
+    ava,
+    el("b", {}, p.name || "Без названия"),
+    el("small", {}, p.description || (p.connected ? "@" + p.bot_username : "Бот не подключён")),
+    el("div", {class: "cnt"}, p.people ? "людей: " + p.people : "ещё никто не открывал"),
+    btns);
+  card.addEventListener("click", function () { switchProject(p.id); });
+  return card;
+}
+
+function openProjectForm(item) {
+  var draft = item
+    ? {name: item.name, description: item.description}
+    : {name: "", description: ""};
+
+  var sheet = el("div", {class: "sheet", id: "sheet"});
+  sheet.append(el("h3", {}, item ? "Изменение проекта" : "Новый проект"));
+  sheet.append(cap("Название"));
+  sheet.append(line(draft.name, "Например: бот для магазина", function (e) {
+    draft.name = e.target.value;
+  }));
+  sheet.append(cap("Описание"));
+  sheet.append(line(draft.description, "Необязательно", function (e) {
+    draft.description = e.target.value;
+  }));
+
+  var go = el("button", {class: "wide"}, item ? "Сохранить" : "Создать");
+  go.addEventListener("click", async function () {
+    if (!draft.name.trim()) { flash("Впишите название"); return; }
+    go.disabled = true;
+    try {
+      if (item) {
+        await api("/api/projects/update", {method: "POST", body: JSON.stringify({
+          project_id: item.id, name: draft.name, description: draft.description,
+        })});
+        closePopups();
+        openProjects();
+      } else {
+        var res = await api("/api/projects/create",
+          {method: "POST", body: JSON.stringify(draft)});
+        closePopups();
+        await switchProject(res.id);
+      }
+    } catch (e) {
+      flash(e.message, "long");
+      go.disabled = false;
+    }
+  });
+  sheet.append(go);
+  sheet.append(el("button", {class: "wide ghost", onclick: function () {
+    closePopups();
+    openProjects();
+  }}, "Отмена"));
+  popup(sheet);
 }
 
 function openBotSheet() {
@@ -4502,6 +4893,34 @@ async function disconnect() {
   } catch (e) { flash(e.message, "long"); }
 }
 
+/* ---- загрузка состояния текущего проекта (старт и переключение проекта) ---- */
+async function loadState() {
+  var state = await api("/api/state");
+  S = (state.scenario && state.scenario.steps) ? state.scenario : {start: "", steps: []};
+  if (!S.steps.length) S.steps.push(blankStep("message"));
+  BOT.connected = state.connected;
+  BOT.bot_username = state.bot_username;
+  BOT.people = state.people;
+  VARS = state.vars || [];
+  TAGS = state.tags || [];
+}
+
+function repaint() {
+  paintChip();
+  paintSave();
+  renderCanvas();
+  renderPanel();
+}
+
+async function switchProject(id) {
+  closePopups();
+  setProjectId(id);
+  try {
+    await loadState();
+    repaint();
+  } catch (e) { flash(e.message, "long"); }
+}
+
 /* ---- старт ---- */
 (async function () {
   var boot = document.getElementById("boot");
@@ -4513,14 +4932,7 @@ async function disconnect() {
     return;
   }
   try {
-    var state = await api("/api/state");
-    S = (state.scenario && state.scenario.steps) ? state.scenario : {start: "", steps: []};
-    if (!S.steps.length) S.steps.push(blankStep("message"));
-    BOT.connected = state.connected;
-    BOT.bot_username = state.bot_username;
-    BOT.people = state.people;
-    VARS = state.vars || [];
-    TAGS = state.tags || [];
+    await loadState();
 
     boot.hidden = true;
     document.getElementById("stage").hidden = false;
@@ -4537,10 +4949,7 @@ async function disconnect() {
     document.getElementById("zoomFit").addEventListener("click", fitView);
 
     attachCanvas();
-    paintChip();
-    paintSave();
-    renderCanvas();
-    renderPanel();
+    repaint();
   } catch (e) {
     boot.className = "boot err";
     boot.textContent = "Не удалось загрузить: " + e.message;
