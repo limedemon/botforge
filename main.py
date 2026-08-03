@@ -2871,7 +2871,7 @@ function serializeRich(box) {
   return out;
 }
 
-/* Текстовое поле с чипами переменных вместо textarea/input. По вводу «"»
+/* Текстовое поле с чипами переменных вместо textarea/input. По вводу «{»
    всплывает список переменных под курсором; выбор вставляет чип, который
    удаляется одним Backspace и копируется как единое целое. */
 function richText(value, placeholder, onchange, multiline) {
@@ -2891,10 +2891,10 @@ function richText(value, placeholder, onchange, multiline) {
     var range = sel.getRangeAt(0);
     if (!range.collapsed || range.startContainer.nodeType !== 3) return null;
     var text = range.startContainer.textContent.slice(0, range.startOffset);
-    var at = text.lastIndexOf('"');
+    var at = text.lastIndexOf('{');
     if (at < 0) return null;
     var filter = text.slice(at + 1);
-    if (filter.indexOf('"') >= 0) return null;
+    if (filter.indexOf('{') >= 0 || filter.indexOf('}') >= 0) return null;
     return {node: range.startContainer, quoteAt: at, endOffset: range.startOffset,
             filter: filter, range: range};
   }
@@ -3862,12 +3862,12 @@ function renderPanel() {
                     "Точно удалить?", function () { removeStep(step.id); }));
 }
 
-/* Текстовое поле сообщения: чипы переменных, набор «"» открывает подсказку. */
+/* Текстовое поле сообщения: чипы переменных, набор «{» открывает подсказку. */
 function textWithVars(value, placeholder, onchange) {
   var box = el("div", {});
   box.append(richText(value, placeholder, onchange, true));
   box.append(el("div", {class: "note", style: "margin-top:6px"},
-    "Наберите «\"» — появится список переменных. Оформление: <b>жирный</b>, " +
+    "Наберите «{» — появится список переменных. Оформление: <b>жирный</b>, " +
     "<i>курсив</i>, <code>код</code>."));
   return box;
 }
@@ -4113,7 +4113,7 @@ function fieldsAction(body, step) {
           action.op = "set";
           signs.value = "set";
         }
-        value.setAttribute("data-ph", numeric ? "число или \"переменная\" + 1"
+        value.setAttribute("data-ph", numeric ? "число или {переменная} + 1"
                                               : "значение, можно с переменными");
         hint.hidden = numeric || !action.name;
       }
@@ -4321,7 +4321,7 @@ function paintChip() {
   var who = document.getElementById("chipWho");
   who.textContent = "";
   who.append(el("b", {}, BOT.connected ? "@" + BOT.bot_username : "Бот не подключён"),
-             el("span", {}, BOT.connected ? "людей: " + BOT.people : "нажмите, чтобы привязать"));
+             el("span", {}, BOT.connected ? "👤 " + BOT.people : "нажмите, чтобы привязать"));
 }
 
 function closePopups() {
@@ -4421,25 +4421,48 @@ function projectRow(p) {
       el("small", {}, "✎ " + when(p.updated_at))),
     el("div", {class: "meta"},
       el("small", {}, p.connected ? "@" + p.bot_username : "не подключён"),
-      el("small", {}, String(p.people))),
+      el("small", {}, "👤 " + p.people)),
     el("button", {class: "mini", onclick: function (e) {
       e.stopPropagation();
       closePopups();
       openProjectForm(p);
     }}, "✎"),
-    armed(el("button", {class: "mini kill"}, "🗑"), "Точно?", async function () {
-      try {
-        await api("/api/projects/delete",
-          {method: "POST", body: JSON.stringify({project_id: p.id})});
-        if (String(p.id) === PROJECT_ID) {
-          setProjectId("");
-          await loadState();
-          repaint();
-        }
-        openProjects();
-      } catch (e) { flash(e.message, "long"); }
-    }));
+    el("button", {class: "mini kill", onclick: function (e) {
+      e.stopPropagation();
+      confirmDeleteProject(p);
+    }}, "🗑"));
   return row;
+}
+
+function confirmDeleteProject(p) {
+  var sheet = el("div", {class: "sheet", id: "sheet"});
+  sheet.append(el("h3", {}, "Удалить проект?"));
+  sheet.append(el("div", {class: "note"},
+    "«" + (p.name || "Без названия") + "» и все его данные удалятся безвозвратно."));
+  var go = el("button", {class: "wide kill"}, "Удалить");
+  go.addEventListener("click", async function () {
+    go.disabled = true;
+    try {
+      await api("/api/projects/delete",
+        {method: "POST", body: JSON.stringify({project_id: p.id})});
+      if (String(p.id) === PROJECT_ID) {
+        setProjectId("");
+        await loadState();
+        repaint();
+      }
+      closePopups();
+      openProjects();
+    } catch (e) {
+      flash(e.message, "long");
+      go.disabled = false;
+    }
+  });
+  sheet.append(go);
+  sheet.append(el("button", {class: "wide ghost", onclick: function () {
+    closePopups();
+    openProjects();
+  }}, "Отмена"));
+  popup(sheet);
 }
 
 function openProjectForm(item) {
@@ -4493,7 +4516,7 @@ function openBotSheet() {
   sheet.append(el("h3", {}, "Ваш бот"));
   if (BOT.connected) {
     sheet.append(el("div", {}, "Работает: @" + BOT.bot_username));
-    sheet.append(el("div", {class: "note"}, "Людей в боте: " + BOT.people));
+    sheet.append(el("div", {class: "note"}, "👤 Людей в боте: " + BOT.people));
     sheet.append(el("button", {class: "wide ghost", onclick: function () {
       closePopups(); openBot();
     }}, "Открыть бота"));
