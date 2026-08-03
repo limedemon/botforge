@@ -1859,7 +1859,7 @@ async def api_projects(request: web.Request) -> web.Response:
     return web.json_response({"projects": [
         {"id": r["id"], "name": r["name"], "description": r["description"],
          "bot_username": r["bot_username"], "connected": bool(r["bot_token"]),
-         "avatar": r["avatar"], "people": r["people"]}
+         "avatar": r["avatar"], "people": r["people"], "updated_at": r["updated_at"]}
         for r in rows
     ]})
 
@@ -2582,25 +2582,13 @@ textarea.inp{min-height:78px;resize:vertical}
          background:#f2f5f8}
 .preview img{display:block;width:100%;max-height:190px;object-fit:contain}
 
-/* ---------- карточки проектов ---------- */
-.projects{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));
-          gap:10px;margin-top:10px}
-.pcard{display:flex;flex-direction:column;gap:5px;padding:10px;border:1px solid var(--line);
-       border-radius:16px;background:#fff}
-.pcard .ava{width:100%;aspect-ratio:1/1;border-radius:12px;background:#f2f5f8;
-            object-fit:cover;display:block}
-.pcard .ava.ph{display:flex;align-items:center;justify-content:center;font-size:26px;
-               color:#9aa4b2;background:#f2f5f8}
-.pcard b{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pcard small{color:#7c8698;font-size:11px;display:-webkit-box;-webkit-line-clamp:2;
-             -webkit-box-orient:vertical;overflow:hidden}
-.pcard .cnt{font-size:11px;color:#9aa4b2}
-.pcard .btns{display:flex;gap:6px;margin-top:auto;padding-top:4px}
-.pcard .btns button{flex:1;font-size:11px;padding:7px 0;border:none;border-radius:9px;
-                     background:#f0f3f7}
-.pcard .btns button.kill{color:var(--danger)}
-.pcard.add{align-items:center;justify-content:center;min-height:150px;background:#f8fafc;
-           border-style:dashed;color:var(--accent);font-size:13px;font-weight:600}
+/* ---------- список проектов ---------- */
+.list-head{display:flex;gap:8px;padding:0 4px 6px;font-size:10px;letter-spacing:.03em;
+           color:#9aa4b2;border-bottom:1px solid var(--line)}
+.list-head span:first-child{flex:1}
+.rw b.link{color:var(--accent);cursor:pointer}
+.rw .meta{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.rw .meta small{color:var(--soft);font-size:11px}
 
 /* ---------- выпадающий выбор с поиском ---------- */
 .combo{position:relative}
@@ -4388,37 +4376,58 @@ function openMenu() {
 async function openProjects() {
   closePopups();
   var screen = el("div", {class: "screen", id: "sheet"});
-  var grid = el("div", {class: "projects"}, el("div", {class: "empty"}, "Загружаю…"));
   screen.append(el("div", {class: "screen-head"},
     el("button", {class: "mini", onclick: closePopups}, "←"),
-    el("h3", {}, "Мои проекты")), grid);
+    el("h3", {}, "Мои проекты")));
+
+  var search = el("input", {class: "inp", placeholder: "Название проекта…"});
+  var add = el("button", {class: "wide", style: "width:auto;margin:0;padding:0 16px;flex:none"},
+    "+ Новый проект");
+  screen.append(el("div", {class: "row", style: "margin-bottom:10px"}, search, add));
+  add.addEventListener("click", function () { closePopups(); openProjectForm(null); });
+
+  screen.append(el("div", {class: "list-head"},
+    el("span", {}, "НАЗВАНИЕ"), el("span", {}, "БОТ"), el("span", {}, "ЛЮДЕЙ")));
+  var rows = el("div", {class: "rows"}, el("div", {class: "empty"}, "Загружаю…"));
+  screen.append(rows);
   document.getElementById("stage").append(screen);
 
-  var projects = [];
+  var all = [];
   try {
-    projects = (await api("/api/projects")).projects || [];
+    all = (await api("/api/projects")).projects || [];
   } catch (e) {
     flash(e.message, "long");
   }
-  grid.textContent = "";
-  projects.forEach(function (p) { grid.append(projectCard(p)); });
-  grid.append(el("button", {class: "pcard add", onclick: function () {
-    closePopups();
-    openProjectForm(null);
-  }}, "+ Создать проект"));
+
+  function draw() {
+    var wanted = search.value.trim().toLowerCase();
+    var shown = all.filter(function (p) {
+      return !wanted || (p.name || "").toLowerCase().indexOf(wanted) >= 0;
+    });
+    rows.textContent = "";
+    if (!shown.length) {
+      rows.append(el("div", {class: "empty"}, "Ничего не найдено."));
+    }
+    shown.forEach(function (p) { rows.append(projectRow(p)); });
+  }
+  search.addEventListener("input", draw);
+  draw();
 }
 
-function projectCard(p) {
-  var ava = p.avatar
-    ? el("img", {class: "ava", src: "/img/" + p.avatar})
-    : el("div", {class: "ava ph"}, (p.bot_username || p.name || "?").slice(0, 1).toUpperCase());
-  var btns = el("div", {class: "btns"},
-    el("button", {onclick: function (e) {
+function projectRow(p) {
+  var row = el("div", {class: "rw"},
+    el("div", {class: "grow", onclick: function () { switchProject(p.id); }},
+      el("b", {class: "link"}, p.name || "Без названия"),
+      el("small", {}, "✎ " + when(p.updated_at))),
+    el("div", {class: "meta"},
+      el("small", {}, p.connected ? "@" + p.bot_username : "не подключён"),
+      el("small", {}, String(p.people))),
+    el("button", {class: "mini", onclick: function (e) {
       e.stopPropagation();
       closePopups();
       openProjectForm(p);
-    }}, "Изменить"),
-    armed(el("button", {class: "kill"}, "Удалить"), "Точно?", async function () {
+    }}, "✎"),
+    armed(el("button", {class: "mini kill"}, "🗑"), "Точно?", async function () {
       try {
         await api("/api/projects/delete",
           {method: "POST", body: JSON.stringify({project_id: p.id})});
@@ -4430,14 +4439,7 @@ function projectCard(p) {
         openProjects();
       } catch (e) { flash(e.message, "long"); }
     }));
-  var card = el("div", {class: "pcard"},
-    ava,
-    el("b", {}, p.name || "Без названия"),
-    el("small", {}, p.description || (p.connected ? "@" + p.bot_username : "Бот не подключён")),
-    el("div", {class: "cnt"}, p.people ? "людей: " + p.people : "ещё никто не открывал"),
-    btns);
-  card.addEventListener("click", function () { switchProject(p.id); });
-  return card;
+  return row;
 }
 
 function openProjectForm(item) {
