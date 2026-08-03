@@ -373,7 +373,13 @@ class Db:
             log.info("Убрал «-pooler» из адреса базы: asyncpg держит свой пул")
 
         dsn = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, "", ""))
-        ssl_ctx = None if sslmode == "disable" else ssl_mod.create_default_context()
+        ssl_ctx = None
+        if sslmode != "disable":
+            # Не у всех провайдеров (напр. Timeweb) корневой сертификат есть
+            # в доверенном списке ОС — проверяем только шифрование, не цепочку.
+            ssl_ctx = ssl_mod.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl_mod.CERT_NONE
 
         # Спящая база просыпается не мгновенно — на старте даём ей несколько
         # попыток, иначе сервис упадёт и уйдёт в бесконечный перезапуск.
@@ -2102,9 +2108,8 @@ async def hook_main(request: web.Request) -> web.Response:
                   "блоков, вставьте токен своего бота от @BotFather, и он "
                   "заработает."),
             reply_markup={
-                "keyboard": [[{"text": "Открыть конструктор",
-                               "web_app": {"url": PUBLIC_URL + "/"}}]],
-                "resize_keyboard": True,
+                "inline_keyboard": [[{"text": "Открыть конструктор",
+                                      "web_app": {"url": PUBLIC_URL + "/"}}]],
             },
         )
     return web.json_response({"ok": True})
