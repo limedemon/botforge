@@ -2563,6 +2563,11 @@ textarea.inp{min-height:78px;resize:vertical}
 .menu hr{margin:5px 8px;border:none;border-top:1px solid var(--line)}
 .sheet.big{width:min(620px,94vw);max-height:86vh}
 
+.screen{position:absolute;inset:0;z-index:8;background:var(--sheet);overflow-y:auto;
+        padding:14px}
+.screen-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.screen-head h3{margin:0;font-size:16px}
+
 /* ---------- галерея картинок ---------- */
 .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;
          margin-top:10px}
@@ -4381,10 +4386,13 @@ function openMenu() {
 }
 
 async function openProjects() {
-  var sheet = el("div", {class: "sheet big", id: "sheet"});
+  closePopups();
+  var screen = el("div", {class: "screen", id: "sheet"});
   var grid = el("div", {class: "projects"}, el("div", {class: "empty"}, "Загружаю…"));
-  sheet.append(el("h3", {}, "Мои проекты"), grid);
-  popup(sheet);
+  screen.append(el("div", {class: "screen-head"},
+    el("button", {class: "mini", onclick: closePopups}, "←"),
+    el("h3", {}, "Мои проекты")), grid);
+  document.getElementById("stage").append(screen);
 
   var projects = [];
   try {
