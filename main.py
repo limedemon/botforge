@@ -4373,18 +4373,19 @@ function openMenu() {
   popup(menu);
 }
 
-async function openProjects() {
+async function openProjects(showBack) {
+  if (showBack === undefined) showBack = true;
   closePopups();
   var screen = el("div", {class: "screen", id: "sheet"});
   screen.append(el("div", {class: "screen-head"},
-    el("button", {class: "mini", onclick: closePopups}, "←"),
+    showBack ? el("button", {class: "mini", onclick: closePopups}, "←") : null,
     el("h3", {}, "Мои проекты")));
 
   var search = el("input", {class: "inp", placeholder: "Название проекта…"});
   var add = el("button", {class: "wide", style: "width:auto;margin:0;padding:0 16px;flex:none"},
     "+ Новый проект");
   screen.append(el("div", {class: "row", style: "margin-bottom:10px"}, search, add));
-  add.addEventListener("click", function () { closePopups(); openProjectForm(null); });
+  add.addEventListener("click", function () { closePopups(); openProjectForm(null, showBack); });
 
   screen.append(el("div", {class: "list-head"},
     el("span", {}, "НАЗВАНИЕ"), el("span", {}, "БОТ"), el("span", {}, "ЛЮДЕЙ")));
@@ -4408,13 +4409,13 @@ async function openProjects() {
     if (!shown.length) {
       rows.append(el("div", {class: "empty"}, "Ничего не найдено."));
     }
-    shown.forEach(function (p) { rows.append(projectRow(p)); });
+    shown.forEach(function (p) { rows.append(projectRow(p, showBack)); });
   }
   search.addEventListener("input", draw);
   draw();
 }
 
-function projectRow(p) {
+function projectRow(p, showBack) {
   var row = el("div", {class: "rw"},
     el("div", {class: "grow", onclick: function () { switchProject(p.id); }},
       el("b", {class: "link"}, p.name || "Без названия"),
@@ -4425,16 +4426,16 @@ function projectRow(p) {
     el("button", {class: "mini", onclick: function (e) {
       e.stopPropagation();
       closePopups();
-      openProjectForm(p);
+      openProjectForm(p, showBack);
     }}, "✎"),
     el("button", {class: "mini kill", onclick: function (e) {
       e.stopPropagation();
-      confirmDeleteProject(p);
+      confirmDeleteProject(p, showBack);
     }}, "🗑"));
   return row;
 }
 
-function confirmDeleteProject(p) {
+function confirmDeleteProject(p, showBack) {
   var sheet = el("div", {class: "sheet", id: "sheet"});
   sheet.append(el("h3", {}, "Удалить проект?"));
   sheet.append(el("div", {class: "note"},
@@ -4451,7 +4452,7 @@ function confirmDeleteProject(p) {
         repaint();
       }
       closePopups();
-      openProjects();
+      openProjects(showBack);
     } catch (e) {
       flash(e.message, "long");
       go.disabled = false;
@@ -4460,12 +4461,12 @@ function confirmDeleteProject(p) {
   sheet.append(go);
   sheet.append(el("button", {class: "wide ghost", onclick: function () {
     closePopups();
-    openProjects();
+    openProjects(showBack);
   }}, "Отмена"));
   popup(sheet);
 }
 
-function openProjectForm(item) {
+function openProjectForm(item, showBack) {
   var draft = item
     ? {name: item.name, description: item.description}
     : {name: "", description: ""};
@@ -4491,7 +4492,7 @@ function openProjectForm(item) {
           project_id: item.id, name: draft.name, description: draft.description,
         })});
         closePopups();
-        openProjects();
+        openProjects(showBack);
       } else {
         var res = await api("/api/projects/create",
           {method: "POST", body: JSON.stringify(draft)});
@@ -4506,7 +4507,7 @@ function openProjectForm(item) {
   sheet.append(go);
   sheet.append(el("button", {class: "wide ghost", onclick: function () {
     closePopups();
-    openProjects();
+    openProjects(showBack);
   }}, "Отмена"));
   popup(sheet);
 }
@@ -4965,11 +4966,6 @@ async function switchProject(id) {
     return;
   }
   try {
-    await loadState();
-
-    boot.hidden = true;
-    document.getElementById("stage").hidden = false;
-
     document.getElementById("plus").addEventListener("click", function () { openPalette(); });
     document.getElementById("menuBtn").addEventListener("click", openMenu);
     document.getElementById("varsBtn").addEventListener("click", openVars);
@@ -4980,9 +4976,13 @@ async function switchProject(id) {
     document.getElementById("zoomIn").addEventListener("click", function () { zoomBy(1.2); });
     document.getElementById("zoomOut").addEventListener("click", function () { zoomBy(0.83); });
     document.getElementById("zoomFit").addEventListener("click", fitView);
-
     attachCanvas();
-    repaint();
+
+    boot.hidden = true;
+    document.getElementById("stage").hidden = false;
+
+    /* Стартовый экран — список проектов, а не сразу редактор. */
+    await openProjects(false);
   } catch (e) {
     boot.className = "boot err";
     boot.textContent = "Не удалось загрузить: " + e.message;
