@@ -2412,12 +2412,24 @@ button{cursor:pointer}
 .wire{fill:none;stroke:#9db4c9;stroke-width:2}
 .wire.yes{stroke:#2fbf87}
 .wire.no{stroke:#e2483d}
+.wire.ghost{stroke-dasharray:5 5;opacity:.65}
 /* Вход в блок — такой же полый кружок, как и выход из него. */
 .wire-end{fill:#fff;stroke:#9db4c9;stroke-width:2}
 .cut{position:absolute;width:34px;height:34px;border:none;border-radius:10px;
      background:#fff;color:var(--danger);font-size:18px;font-weight:800;
      -webkit-text-stroke:.7px currentColor;transform-origin:50% 100%;
      box-shadow:0 3px 12px rgba(21,40,60,.28)}
+
+/* ---------- меню выбора блока в точке клика/отпускания ---------- */
+.quick{position:absolute;min-width:180px;padding:6px;border-radius:14px;
+       background:var(--sheet);box-shadow:0 10px 30px rgba(21,40,60,.25);
+       transform-origin:0 0}
+.quick button{display:flex;align-items:center;gap:8px;width:100%;padding:9px 10px;
+              border:none;border-radius:10px;background:transparent;text-align:left;
+              font-size:13px;font-weight:600}
+.quick button .glyph{font-size:14px;opacity:.8}
+.quick button.kill{color:var(--danger)}
+.quick button.cancel{color:var(--soft);font-weight:400}
 
 /* ---------- блок ---------- */
 .node{position:absolute;width:210px;border-radius:12px;background:#fff;color:var(--ink);
@@ -3099,6 +3111,8 @@ function cleanName(text) {
 var SEL = "";             /* какой блок выбран */
 var LINKING = null;       /* {id, out} — от какого кружка тянем стрелку */
 var CUT = null;           /* {id, out, x, y} — по какой линии нажали */
+var QUICK = null;         /* {x, y, sourceId, sourceOut} — меню выбора блока */
+var DRAG = null;          /* {id, out, x1, y1, cx, cy, moved} — тащим стрелку */
 var WIRES = [];           /* где сейчас проходят стрелки */
 var PAN = {x: 40, y: 90, z: 1, ready: false};
 var NODES = {};
@@ -3234,6 +3248,7 @@ function applyPan() {
 
 function fitView() {
   dropCut();
+  dropQuick();
   var canvas = document.getElementById("canvas");
   if (!S.steps.length || !canvas.clientWidth) return;
   var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -3251,6 +3266,7 @@ function fitView() {
 
 function zoomBy(factor) {
   dropCut();                       /* корзина прибита к своему масштабу */
+  dropQuick();
   var canvas = document.getElementById("canvas");
   var cx = canvas.clientWidth / 2, cy = canvas.clientHeight / 2;
   var wx = (cx - PAN.x) / PAN.z, wy = (cy - PAN.y) / PAN.z;
@@ -3449,8 +3465,14 @@ function nodeEl(step) {
                                  (out.kind === "url" ? " url" : "") +
                                  (wired ? " wired" : "") + (lit ? " on" : "")});
     if (out.kind !== "url") {
-      /* Кружок не должен таскать блок — гасим начало перетаскивания. */
-      dot.addEventListener("pointerdown", function (e) { e.stopPropagation(); });
+      /* Кружок не должен таскать блок — гасим начало перетаскивания. Тут же
+         стартуем слежение за настоящим drag'ом стрелки (см. onDragMove/Up) —
+         если пальц/мышь не сдвинулись, сработает обычный click → armPort,
+         старый тап-тап способ никуда не делся. */
+      dot.addEventListener("pointerdown", function (e) {
+        e.stopPropagation();
+        startWireDrag(e, step, oi);
+      });
       dot.addEventListener("click", function (e) {
         e.stopPropagation();
         armPort(step, oi);
@@ -3481,6 +3503,7 @@ function attachDrag(node, step) {
     if (e.button === 1 || e.button === 2) return;
     e.stopPropagation();                     /* иначе поедет всё полотно */
     dropCut();                               /* корзина с линии больше не нужна */
+    dropQuick();
     grab = {x: e.clientX, y: e.clientY, sx: step.x, sy: step.y, moved: false};
     try { node.setPointerCapture(e.pointerId); } catch (err) {}
     node.classList.add("dragging");
@@ -3511,29 +3534,92 @@ function attachDrag(node, step) {
   });
 }
 
+/* Настоящее перетаскивание стрелки: нажали на кружок и, не отпуская,
+   ведём палец/мышь. Если в итоге не сдвинулись — ничего не делаем, дальше
+   сработает обычный click на кружке (старый способ тап-тап). */
+function startWireDrag(e, step, oi) {
+  var fromNode = NODES[step.id];
+  var port = fromNode && fromNode.querySelector('[data-out="' + oi + '"]');
+  if (!port) return;
+  DRAG = {id: step.id, out: oi, moved: false, cx: e.clientX, cy: e.clientY,
+          x1: step.x + fromNode.offsetWidth,
+          y1: step.y + port.offsetTop + port.offsetHeight / 2};
+  /* Начали новую стрелку от ДРУГОГО кружка — прежняя ждущая (тап-тап)
+     больше не актуальна. Тот же кружок трогаем — оставляем LINKING как есть,
+     иначе сломается «нажать на тот же кружок ещё раз — отменить». Перерисуем
+     позже, вместе с итогом самого перетаскивания. */
+  if (LINKING && (LINKING.id !== step.id || LINKING.out !== oi)) LINKING = null;
+  CUT = null;
+  QUICK = null;
+  document.addEventListener("pointermove", onDragMove);
+  document.addEventListener("pointerup", onDragUp);
+  document.addEventListener("pointercancel", onDragUp);
+}
+
+function onDragMove(e) {
+  if (!DRAG) return;
+  var dx = (e.clientX - DRAG.cx) / PAN.z, dy = (e.clientY - DRAG.cy) / PAN.z;
+  if (!DRAG.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+  DRAG.moved = true;
+  var svg = document.getElementById("wires");
+  if (!svg) return;
+  var spot = worldAt(e);
+  var old = document.getElementById("dragGhost");
+  if (old) old.remove();
+  var path = wirePath(DRAG.x1, DRAG.y1, spot.x, spot.y, "ghost");
+  path.id = "dragGhost";
+  svg.append(path);
+}
+
+function onDragUp(e) {
+  document.removeEventListener("pointermove", onDragMove);
+  document.removeEventListener("pointerup", onDragUp);
+  document.removeEventListener("pointercancel", onDragUp);
+  var drag = DRAG;
+  DRAG = null;
+  var ghost = document.getElementById("dragGhost");
+  if (ghost) ghost.remove();
+  if (!drag || !drag.moved) return;      /* обычный тап — им займётся click */
+  e.preventDefault();
+  var target = document.elementFromPoint(e.clientX, e.clientY);
+  var node = target && target.closest && target.closest(".node");
+  var targetStep = node ? byId(node.getAttribute("data-id")) : null;
+  if (targetStep) { connectTo(drag.id, drag.out, targetStep.id); return; }
+  openQuick(worldAt(e), drag.id, drag.out);
+}
+
 function armPort(step, outIndex) {
   var same = LINKING && LINKING.id === step.id && LINKING.out === outIndex;
   LINKING = same ? null : {id: step.id, out: outIndex};
   CUT = null;
+  QUICK = null;
   renderCanvas();
 }
 
-function linkTo(target) {
-  var source = byId(LINKING.id);
-  var output = source ? outputsOf(source)[LINKING.out] : null;
-  if (!output) { LINKING = null; renderCanvas(); return; }
-  var already = output.to === target.id;
-  setLink(source, LINKING.out, already ? "" : target.id);
-  LINKING = null;
+/* Общий узел подключения — им же пользуется и тап-тап, и настоящий drag
+   от кружка. Повторное указание на ту же цель отвязывает (как и раньше). */
+function connectTo(sourceId, outIndex, targetId) {
+  var source = byId(sourceId);
+  var output = source ? outputsOf(source)[outIndex] : null;
+  if (!output) return;
+  var already = output.to === targetId;
+  setLink(source, outIndex, already ? "" : targetId);
   touch();
   renderCanvas();
   if (SEL === source.id) renderPanel();
+}
+
+function linkTo(target) {
+  connectTo(LINKING.id, LINKING.out, target.id);
+  LINKING = null;
+  renderCanvas();
 }
 
 function select(id) {
   SEL = id;
   LINKING = null;
   CUT = null;
+  QUICK = null;
   renderCanvas();
   renderPanel();
 }
@@ -3542,12 +3628,14 @@ function deselect() {
   SEL = "";
   LINKING = null;
   CUT = null;
+  QUICK = null;
   renderCanvas();
   renderPanel();
 }
 
 /* Нажали по линии — над этим местом показываем корзину. */
 function armCut(stepId, outIndex, at) {
+  QUICK = null;
   var source = byId(stepId);
   if (!source || !outputsOf(source)[outIndex]) { CUT = null; return; }
   CUT = {id: stepId, out: outIndex, x: at.x, y: at.y};
@@ -3562,6 +3650,64 @@ function dropCut() {
   CUT = null;
   var button = document.getElementById("cut");
   if (button) button.remove();
+}
+
+function dropQuick() {
+  if (!QUICK) return;
+  QUICK = null;
+  var menu = document.getElementById("quick");
+  if (menu) menu.remove();
+  var ghost = document.getElementById("quickGhost");
+  if (ghost) ghost.remove();
+}
+
+/* Открывает меню выбора блока в точке at. Если sourceId непустой — это
+   продолжение стрелки (тап-тап или настоящий drag), иначе — просто
+   «добавить блок здесь» по обычному клику мимо блоков. */
+function openQuick(at, sourceId, sourceOut) {
+  QUICK = {x: at.x, y: at.y, sourceId: sourceId || "", sourceOut: sourceOut};
+  LINKING = null;
+  CUT = null;
+  renderCanvas();
+}
+
+function quickMenu() {
+  var source = QUICK.sourceId ? byId(QUICK.sourceId) : null;
+  var output = source ? outputsOf(source)[QUICK.sourceOut] : null;
+  var menu = el("div", {
+    class: "quick", id: "quick",
+    style: "left:" + QUICK.x + "px;top:" + QUICK.y + "px;" +
+           "transform:scale(" + (1 / PAN.z).toFixed(3) + ")",
+    onpointerdown: function (e) { e.stopPropagation(); },
+  });
+  ORDER.forEach(function (type) {
+    menu.append(el("button", {class: "h-" + META[type].tone,
+                              onclick: function () { quickAdd(type); }},
+      el("span", {class: "glyph"}, META[type].glyph),
+      el("span", {}, META[type].title)));
+  });
+  if (output && output.to) {
+    menu.append(el("button", {class: "kill", onclick: function () {
+      setLink(source, QUICK.sourceOut, "");
+      QUICK = null;
+      touch();
+      renderCanvas();
+      if (SEL === source.id) renderPanel();
+    }}, "Отвязать"));
+  }
+  menu.append(el("button", {class: "cancel", onclick: function () {
+    QUICK = null;
+    renderCanvas();
+  }}, "Отмена"));
+  return menu;
+}
+
+function quickAdd(type) {
+  var at = {x: QUICK.x, y: QUICK.y};
+  var sourceId = QUICK.sourceId, outIdx = QUICK.sourceOut;
+  QUICK = null;
+  var step = addStep(type, at);
+  if (sourceId) connectTo(sourceId, outIdx, step.id);
 }
 
 function cutButton() {
@@ -3644,6 +3790,23 @@ function renderCanvas() {
 
   if (CUT && byId(CUT.id)) world.append(cutButton());
 
+  if (QUICK) {
+    if (QUICK.sourceId && !byId(QUICK.sourceId)) QUICK.sourceId = "";
+    if (QUICK.sourceId) {
+      var qfrom = NODES[QUICK.sourceId];
+      var qport = qfrom && qfrom.querySelector('[data-out="' + QUICK.sourceOut + '"]');
+      if (qfrom && qport) {
+        var qsrc = byId(QUICK.sourceId);
+        var qx1 = qsrc.x + qfrom.offsetWidth;
+        var qy1 = qsrc.y + qport.offsetTop + qport.offsetHeight / 2;
+        var qpath = wirePath(qx1, qy1, QUICK.x, QUICK.y, "ghost");
+        qpath.id = "quickGhost";
+        svg.append(qpath);
+      }
+    }
+    world.append(quickMenu());
+  }
+
   var tip = document.getElementById("tip");
   tip.hidden = !LINKING;
   if (LINKING) {
@@ -3655,17 +3818,19 @@ function renderCanvas() {
   }
 }
 
+/* Перевод экранных координат в мировые (те же, что у step.x/step.y) —
+   нужна и внутри attachCanvas(), и при перетаскивании стрелки от кружка. */
+function worldAt(e) {
+  var box = document.getElementById("canvas").getBoundingClientRect();
+  return {x: (e.clientX - box.left - PAN.x) / PAN.z,
+          y: (e.clientY - box.top - PAN.y) / PAN.z};
+}
+
 /* Полотно: одним пальцем двигаем, двумя — приближаем.
-   Два быстрых касания (или правая кнопка мыши) по пустому месту — палитра. */
+   Тап по пустому месту (или правая кнопка мыши) — меню выбора блока. */
 function attachCanvas() {
   var canvas = document.getElementById("canvas");
-  var points = {}, pan = null, pinch = null, tap = null;
-
-  function worldAt(e) {
-    var box = canvas.getBoundingClientRect();
-    return {x: (e.clientX - box.left - PAN.x) / PAN.z,
-            y: (e.clientY - box.top - PAN.y) / PAN.z};
-  }
+  var points = {}, pan = null, pinch = null;
 
   /* Куда именно нажали. Спрашивать об этом у события отпускания нельзя:
      полотно на нажатии забирает указатель себе, и потом браузер сообщает
@@ -3693,6 +3858,7 @@ function attachCanvas() {
       try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
     } else if (list.length === 2) {
       dropCut();
+      dropQuick();
       var box = canvas.getBoundingClientRect();
       var mx = (points[list[0]].x + points[list[1]].x) / 2 - box.left;
       var my = (points[list[0]].y + points[list[1]].y) / 2 - box.top;
@@ -3735,23 +3901,16 @@ function attachCanvas() {
       var wire = wireAt(spot, 18 / PAN.z);
       if (wire) {
         pan = null;
-        tap = null;
         armCut(wire.id, wire.out, spot);
         if (!ids().length) pan = null;
         return;
       }
 
       dropCut();
-      var now = new Date().getTime();
-      var again = tap && now - tap.at < 340 &&
-                  Math.abs(e.clientX - tap.x) < 26 && Math.abs(e.clientY - tap.y) < 26;
-      if (again) {                    /* два касания подряд — добавляем блок */
-        tap = null;
-        openPalette(worldAt(e));
-      } else {                        /* одиночный тап мимо блоков — снять выбор */
-        tap = {at: now, x: e.clientX, y: e.clientY};
-        if (LINKING || SEL) deselect();
-      }
+      /* Тап мимо блоков и стрелок — меню выбора блока прямо тут: если до
+         этого ждали, куда вести стрелку (LINKING), она подключится к
+         созданному блоку; иначе это просто «добавить блок здесь». */
+      openQuick(spot, LINKING ? LINKING.id : "", LINKING ? LINKING.out : -1);
     }
     if (!ids().length) pan = null;
   }
@@ -3761,6 +3920,7 @@ function attachCanvas() {
   canvas.addEventListener("wheel", function (e) {
     e.preventDefault();
     dropCut();
+    dropQuick();
     var box = canvas.getBoundingClientRect();
     var mx = e.clientX - box.left, my = e.clientY - box.top;
     var wx = (mx - PAN.x) / PAN.z, wy = (my - PAN.y) / PAN.z;
@@ -4861,6 +5021,7 @@ function addStep(type, at) {
   if (!S.start && type !== "note") S.start = step.id;
   touch();
   select(step.id);
+  return step;
 }
 
 function openBot() {
