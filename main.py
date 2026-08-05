@@ -2466,7 +2466,10 @@ button{cursor:pointer}
 .port>span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .port.tail{background:transparent;text-align:right;color:var(--soft);padding-right:18px;
            margin-bottom:8px}
-.dot{position:absolute;right:-7px;top:50%;width:13px;height:13px;border-radius:50%;
+/* right считается от полоски (.port), а не от самого блока — у полоски
+   справа ещё есть свои 10px отступа до края блока. Прибавляем их, чтобы
+   кружок вправду торчал наружу, а не прятался внутри карточки. */
+.dot{position:absolute;right:-17px;top:50%;width:13px;height:13px;border-radius:50%;
      transform:translateY(-50%);background:#fff;border:2px solid #9db4c9;cursor:pointer}
 .dot.yes{border-color:#2fbf87}
 .dot.no{border-color:#e2483d}
