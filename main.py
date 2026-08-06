@@ -3844,7 +3844,9 @@ function attachCanvas() {
 
   canvas.addEventListener("contextmenu", function (e) {
     e.preventDefault();
-    if (!onNode(e.target)) openPalette(worldAt(e));
+    if (!onNode(e.target)) {
+      openQuick(worldAt(e), LINKING ? LINKING.id : "", LINKING ? LINKING.out : -1);
+    }
   });
 
   function ids() { return Object.keys(points); }
@@ -3910,10 +3912,17 @@ function attachCanvas() {
       }
 
       dropCut();
-      /* Тап мимо блоков и стрелок — меню выбора блока прямо тут: если до
-         этого ждали, куда вести стрелку (LINKING), она подключится к
-         созданному блоку; иначе это просто «добавить блок здесь». */
-      openQuick(spot, LINKING ? LINKING.id : "", LINKING ? LINKING.out : -1);
+      if (e.pointerType === "mouse") {
+        /* На ПК обычный клик мимо блоков — снять выбор/убрать меню, если
+           оно уже открыто. Меню выбора блока на ПК — только правой кнопкой
+           (см. contextmenu) или настоящим перетаскиванием стрелки. */
+        if (LINKING || SEL || QUICK) deselect();
+      } else {
+        /* На телефоне тапа по пустому месту достаточно: если до этого ждали,
+           куда вести стрелку (LINKING), она подключится к созданному блоку;
+           иначе это просто «добавить блок здесь». */
+        openQuick(spot, LINKING ? LINKING.id : "", LINKING ? LINKING.out : -1);
+      }
     }
     if (!ids().length) pan = null;
   }
@@ -4492,6 +4501,9 @@ function closePopups() {
     var node = document.getElementById(id);
     if (node) node.remove();
   });
+  /* Открыли что-то другое (меню, форму) — зависшее меню выбора блока на
+     схеме больше ни к чему, оно бы просто мешалось. */
+  dropQuick();
 }
 
 function popup(node) {
